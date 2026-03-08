@@ -1,6 +1,6 @@
 # Baggins Capital
 
-An autonomous hedge fund that bets on crypto prices and weather temperatures on [Polymarket](https://polymarket.com). Every component is an "employee" — a specialized agent that does its job, learns from results, and gets better over time.
+An autonomous hedge fund that bets on crypto prices, commodities, equities, and weather temperatures on [Polymarket](https://polymarket.com). Every component is an "employee" — a specialized agent that does its job, learns from results, and gets better over time.
 
 Powered by [Bankr](https://bankr.bot/) for trade execution and wallet management on Polymarket.
 
@@ -10,12 +10,14 @@ Powered by [Bankr](https://bankr.bot/) for trade execution and wallet management
 
 ```
 The Manager
-    ├── The Crypto Trader      (crypto price markets)
+    ├── The Crypto Trader      (crypto, commodities, equities)
     ├── The Weather Analyst     (temperature prediction)
     ├── The Scalper             (15-min up/down markets)
+    ├── The Sports Buddy        (UFC, boxing, playoffs)
     ├── The Settlement Clerk    (resolves bets, claims winnings)
     ├── The CFO                 (balance & risk management)
     ├── The Accountant          (tracks every bet & P&L)
+    ├── The Detective           (30h strategy review)
     └── The Messenger           (Telegram alerts)
 ```
 
@@ -27,7 +29,21 @@ Runs the whole operation. Orchestrates every employee on a 2-minute cycle loop. 
 ## Trading Floor
 
 ### The Crypto Trader (`polymarket_crypto.py`)
-Scans Polymarket for crypto price prediction markets (BTC, ETH, SOL, XRP, DOGE, ADA, LINK, AVAX, and more). Flat $3 bets, 168-hour scan window, 15% minimum edge. Same-day markets (<12h to resolution) get a 1.5x priority boost.
+Scans Polymarket for price prediction markets — crypto (BTC, ETH, SOL, XRP, DOGE, ADA, LINK, AVAX), commodities (Gold, Silver, Crude Oil), and equities (NVIDIA, Tesla). Dual price feeds: CoinGecko for crypto, Yahoo Finance for commodities/equities. Flat $3 bets, 720-hour scan window (30 days), 15% minimum edge, 15 max concurrent positions.
+
+**Bet Classification** — Every market gets categorized by type, each with its own confidence scoring track:
+
+| Type | What | Starts At |
+|------|------|-----------|
+| **HOLD** | Price already past target, just needs to stay | 50 |
+| **FADE** | Betting price won't reach a far target | 45 |
+| **SNAP** | Close to target, early resolution play | 40 |
+| **LOTTO** | Cheap longshot, 10x+ payout potential | 30 |
+| **DECAY** | Short-dated, predictable price behavior | 48 |
+| **COMPRESSION** | Cheap + mispriced asymmetric play | 42 |
+| **MOMENTUM** | Trend-following with confirmation | 38 |
+
+**Early Resolution Insight**: Markets like "Will Oil hit $60 by March 31?" resolve the *moment* price touches $60 — not at the deadline. A "23 day" market could resolve in hours. The classification system is built around this.
 
 ### The Weather Analyst (`weather_agent.py`)
 A whole department in one file:
@@ -43,7 +59,7 @@ A whole department in one file:
 **Forecast Collection**: Every 30 minutes, the Meteorologist collects readings from all 7 APIs for every active city and stores them in the `forecast_snapshots` table. During betting windows, accumulated snapshot data is used — multiple readings per source, with drift and stability metrics. This builds a dataset so the system knows exactly which sources to trust for which cities. API calls are staggered with 1.5s delays to avoid rate limiting.
 
 ### The Scalper (`updown_trader.py`)
-Trades BTC/ETH "Up or Down" 15-minute markets. Fires at :08, :23, :38, :53 each hour. Bets both UP and DOWN when confident. Flat $2 bets, minimum score 5.0, max 8 bets/day, $10 daily drawdown limit, 45-min cooldown after any loss. Scoring: MA alignment (+/-2), candle direction (+/-1.5), RSI (+/-1), low volatility (+1), volume multiplier (x1.2). Max possible ~7.2.
+Trades BTC/ETH/SOL/XRP "Up or Down" 15-minute markets. Fires at :08, :23, :38, :53 each hour (blackout 11am-2pm ET). Bets both UP and DOWN — score alone decides direction. Flat $2 bets, score range 4.5-6.5, max 12 bets/day, $10 daily drawdown limit, 45-min cooldown after any loss. Scoring: MA alignment (+/-2), candle direction (+/-1.5), RSI (+/-1), low volatility (+1), volume multiplier (x1.2). Max possible ~7.2. Price gate: only bets when our side is 35-45c (value zone).
 
 ---
 
@@ -60,6 +76,12 @@ Central balance authority. Enforces deployment cap (70% of balance), $5 reserve,
 
 ### The Accountant (`performance_tracker.py`)
 Logs every bet, resolution, and daily P&L. Maintains the database — the company's single source of truth.
+
+### The Detective (`pattern_analyzer`)
+Runs a 30-hour strategy review. Analyzes bet history, finds losing patterns (city/side combos, forecast vs outcome mismatches), and sends actionable findings to Telegram.
+
+### The Sports Buddy (`sports_analyst.py`)
+Scans Polymarket for sports events (UFC, boxing, NBA/NHL playoffs, Champions League). $1 exploratory bets, max 3/day, 55+ confidence minimum.
 
 ### The Messenger (`bet_notifier.py`)
 Sends Telegram alerts on every bet placement and resolution. Daily summaries with P&L breakdown.
@@ -140,10 +162,12 @@ cp .env.example .env
 Edit `hedge_fund_config.py` to set your risk levels:
 
 ```python
-# Crypto
-CRYPTO_BET_SIZE = 3.0        # $ per crypto bet
+# Crypto / Commodities / Equities
+CRYPTO_BET_SIZE = 3.0        # $ per bet
 CRYPTO_MAX_DAILY = 20        # max bets per day
+CRYPTO_MAX_CONCURRENT = 15   # max open positions
 CRYPTO_MIN_EDGE = 0.15       # 15% minimum edge
+CRYPTO_MAX_HOURS = 720       # 30-day scan window
 
 # Weather
 WEATHER_BET_SIZE = 1.0       # $ per weather bet
@@ -151,8 +175,9 @@ WEATHER_MAX_DAILY = 30       # max bets per day
 
 # Scalper (15-min markets)
 SCALPER_BET_SIZE = 2.0       # $ per scalp
-SCALPER_MAX_DAILY = 8        # max bets per day
-SCALPER_MIN_SCORE = 5.0      # minimum signal score (max ~7.2)
+SCALPER_MAX_DAILY = 12       # max bets per day
+SCALPER_MIN_SCORE = 4.5      # score range 4.5-6.5
+SCALPER_ASSETS = ['btc', 'eth', 'sol', 'xrp']
 ```
 
 ### 5. Run it
@@ -205,17 +230,17 @@ sudo systemctl start baggins-capital
               │ (bankr.py) │          │    Clerk    │
               └─────┬─────┘          └──────┬──────┘
                     │                        │
-         ┌──────────┼──────────┐            │
-         │          │          │            │
-    ┌────▼───┐ ┌───▼────┐ ┌──▼───┐  ┌────▼─────┐
-    │ Crypto │ │Weather │ │Scalp │  │Accountant│
-    │ Trader │ │Analyst │ │  er  │  │ (P&L DB) │
-    └────────┘ └───┬────┘ └──────┘  └──────────┘
-                   │
-            ┌──────▼──────┐
-            │  7 Weather  │
-            │    APIs     │
-            └─────────────┘
+     ┌──────────┬───┴────┬──────────┐       │
+     │          │        │          │       │
+┌────▼───┐ ┌───▼────┐ ┌─▼────┐ ┌──▼───┐ ┌─▼────────┐
+│ Crypto │ │Weather │ │Scalp │ │Sports│ │Accountant│
+│ Trader │ │Analyst │ │  er  │ │Buddy │ │ (P&L DB) │
+└───┬────┘ └───┬────┘ └──────┘ └──────┘ └──────────┘
+    │          │
+┌───▼────┐ ┌──▼─────────┐
+│Yahoo + │ │  7 Weather  │
+│CoinGeck│ │    APIs     │
+└────────┘ └─────────────┘
 ```
 
 ---

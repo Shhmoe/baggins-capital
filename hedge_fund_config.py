@@ -14,17 +14,17 @@ ENABLE_CRYPTO_MODULE = True       # Alias for ENABLE_POLYMARKET_CRYPTO
 ENABLE_WEATHER_MODULE = True      # Weather temperature betting on Polymarket
 ENABLE_UPDOWN_MODULE = True       # Scalper is ACTIVE
 
-# SCALPER (Up/Down 15-min markets) — Ultra-Selective Mode
-UPDOWN_BET_SIZE = 2.0             # Flat $2 (was $5-15 score-based)
-UPDOWN_MIN_SCORE = 5.0            # Only HIGH confidence (was 4.0)
-UPDOWN_MAX_DAILY = 8              # Quality over quantity
-UPDOWN_DRAWDOWN_LIMIT = 10.0      # $10/day loss limit (was $15)
-UPDOWN_COOLDOWN_MINUTES = 45      # Cooldown after 1 loss (was 30 after 2)
-UPDOWN_COOLDOWN_AFTER_LOSSES = 1  # Pause after 1 loss (was 2)
-UPDOWN_UP_ONLY = False             # No DOWN bets (ties resolve UP = structural edge)
-UPDOWN_MAX_PRICE = 0.45           # Only bet when UP side is cheap (was 0.48)
-UPDOWN_MIN_PRICE = 0.35           # Not too cheap/risky (was 0.30)
-UPDOWN_ASSETS = ['btc', 'eth']    # Focus on highest-volume assets      # Up/Down 15-min bets DISABLED (3W/5L, -$11.69)
+# SCALPER (Up/Down 15-min markets)
+UPDOWN_BET_SIZE = 2.0             # Flat $2 per scalp
+UPDOWN_MIN_SCORE = 4.5            # Score range: 4.5-6.5 (below = low confidence, above = momentum trap)
+UPDOWN_MAX_DAILY = 12             # Max bets per day (4 assets x quality)
+UPDOWN_DRAWDOWN_LIMIT = 10.0      # $10/day loss limit
+UPDOWN_COOLDOWN_MINUTES = 45      # Cooldown after 1 loss
+UPDOWN_COOLDOWN_AFTER_LOSSES = 1  # Pause after 1 loss
+UPDOWN_UP_ONLY = False            # Score decides direction — both UP and DOWN allowed
+UPDOWN_MAX_PRICE = 0.45           # Only bet when our side is cheap (value zone)
+UPDOWN_MIN_PRICE = 0.35           # Not too cheap/risky
+UPDOWN_ASSETS = ['btc', 'eth', 'sol', 'xrp']  # All available up/down markets
 PAUSED_POLYMARKET = False         # Crypto active
 PAUSED_AVANTIS = True            # Avantis active
 
@@ -81,9 +81,9 @@ LOG_FILE = 'hedge_fund.log'
 # =============================================================
 
 CRYPTO_SCAN_INTERVAL = 120       # 2 minutes between scans
-CRYPTO_MAX_HOURS = 168            # 7 days out — find markets early for longer odds
-CRYPTO_MAX_DAILY_BETS = 20       # 20 crypto bets per day (bumped: 56% WR, +$600 P&L)
-CRYPTO_MAX_CONCURRENT = 10       # 10 open crypto positions (bumped: more capacity)
+CRYPTO_MAX_HOURS = 720            # 30 days out — catches end-of-month commodity/equity markets
+CRYPTO_MAX_DAILY_BETS = 20       # 20 crypto bets per day
+CRYPTO_MAX_CONCURRENT = 15       # 15 open crypto positions
 CRYPTO_MIN_CONFIDENCE = 70       # Minimum confidence score (0-100)
 CRYPTO_MIN_EDGE = 0.15           # 15% minimum edge
 CRYPTO_BET_MIN = 3.0             # $3 flat per bet
@@ -113,6 +113,8 @@ CRYPTO_KEYWORDS = [
     'xrp', 'ripple', 'cardano', 'ada', 'dogecoin', 'doge',
     'polygon', 'matic', 'avalanche', 'avax', 'chainlink', 'link',
     'hyperliquid', 'hype',
+    'gold', 'silver', 'crude oil', 'oil',
+    'nvidia', 'nvda', 'tesla', 'tsla',
 ]
 
 # Keywords to EXCLUDE from crypto scanning
@@ -136,6 +138,19 @@ CRYPTO_COINGECKO_IDS = {
     'hyperliquid': 'hyperliquid', 'hype': 'hyperliquid',
 }
 
+# Yahoo Finance price mapping (for commodities/equities — no API key needed)
+# Assets detected via these keywords route to Yahoo Finance instead of CoinGecko
+YAHOO_FINANCE_SYMBOLS = {
+    'gold': 'GC=F', 'silver': 'SI=F',
+    'crude oil': 'CL=F', 'oil': 'CL=F',
+    'nvidia': 'NVDA', 'nvda': 'NVDA',
+    'tesla': 'TSLA', 'tsla': 'TSLA',
+    'bitcoin': 'BTC-USD', 'btc': 'BTC-USD',
+    'ethereum': 'ETH-USD', 'eth': 'ETH-USD',
+    'solana': 'SOL-USD', 'sol': 'SOL-USD',
+    'xrp': 'XRP-USD',
+    'hyperliquid': 'HYPE-USD', 'hype': 'HYPE-USD',
+}
 
 # =============================================================
 # SPORTS ANALYST CONFIG — Baggins' Buddy
