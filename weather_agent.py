@@ -464,12 +464,14 @@ class WeatherForecaster:
             if noaa:
                 forecasts.append(noaa)
 
+        import time as _t; _t.sleep(1.5)  # Rate limit spacing
         # Source 3: WeatherAPI.com (key required)
         if self.weatherapi_key:
             wa = self._fetch_weatherapi(coords, city, target_date)
             if wa:
                 forecasts.append(wa)
 
+        _t.sleep(1.5)
         # Source 4: OpenWeatherMap (v2.0)
         if self.openweathermap_key:
             owm = self._fetch_openweathermap(coords, target_date)
@@ -477,17 +479,20 @@ class WeatherForecaster:
                 forecasts.append(owm)
 
         # Source 5: Visual Crossing (v2.0)
+        _t.sleep(1.5)
         if self.visualcrossing_key:
             vc = self._fetch_visualcrossing(coords, target_date)
             if vc:
                 forecasts.append(vc)
 
+        _t.sleep(1.5)
         # Source 6: Weatherbit (v2.0)
         if self.weatherbit_key:
             wb = self._fetch_weatherbit(coords, target_date)
             if wb:
                 forecasts.append(wb)
 
+        _t.sleep(1.5)
         # Source 7: Pirate Weather (v2.0)
         if self.pirateweather_key:
             pw = self._fetch_pirateweather(coords, target_date)
@@ -1175,6 +1180,40 @@ class EdgeCalculator:
             print(f"  [SKIP] Near-certainty NO ({no_price:.0%}): {market['group_title']}")
             return None
 
+        # === v5.1: MARKET TYPE FILTER ===
+        # THRESHOLD markets (above/below) are profitable: 60% WR, +$7.02
+        # EXACT single-degree markets are catastrophic: 0% WR, -$34.00
+        # BETWEEN X-Y markets only worth it at 10x+ payout (YES side, forecast in range)
+        temp_range_data_check = market.get("temp_range_parsed", market.get("temp_range", {}))
+        is_above_check = temp_range_data_check.get("is_above", False)
+        is_below_check = temp_range_data_check.get("is_below", False)
+        range_low_check = temp_range_data_check.get("low", -999)
+        range_high_check = temp_range_data_check.get("high", 999)
+
+        is_threshold = is_above_check or is_below_check
+        is_exact_range = (range_low_check > -500 and range_high_check < 500 and
+                         range_high_check - range_low_check <= 2)
+        is_single_degree = (range_low_check > -500 and range_high_check < 500 and
+                           range_high_check - range_low_check <= 1 and
+                           not is_above_check and not is_below_check)
+
+        if is_single_degree:
+            # 0% WR across 10 bets, -$36. Block completely.
+            print(f"  [SKIP] Single-degree market (0% WR historically): {market['group_title']}")
+            return None
+
+        if is_exact_range and not is_threshold:
+            # Between X-Y markets: only allow if YES side is cheap enough for 10x+ payout
+            if yes_price > 0.10:
+                print(f"  [SKIP] Exact range market, YES not cheap enough for 10x ({yes_price:.0%}): {market['group_title']}")
+                return None
+            else:
+                print(f"  [10X] Exact range market, YES at {yes_price:.0%} (10x+ potential): {market['group_title']}")
+
+        if is_threshold:
+            print(f"  [PREFERRED] Threshold market (above/below): {market['group_title']}")
+
+
         yes_edge = our_prob - yes_price
         no_edge = (1.0 - our_prob) - no_price
 
@@ -1235,6 +1274,10 @@ class EdgeCalculator:
             side = "yes"
             bet_odds = yes_price
         else:
+            # v5.1: Block NO on narrow range markets (data shows NO loses)
+            if is_exact_range and not is_threshold:
+                print(f"  [SKIP] Would be NO on exact range - blocked: {market['group_title']}")
+                return None
             edge = no_edge
             side = "no"
             bet_odds = no_price
@@ -1284,6 +1327,9 @@ class EdgeCalculator:
 
         # Confidence scoring (0-100) v3.0: recalibrated
         confidence = 25  # Deflated from 45 — old baseline was decorative (70+ for everything)
+        # v5.1: Market type bonus
+        if is_threshold:
+            confidence += 15  # Threshold markets have 60% WR
 
         if spread <= 1:
             confidence += 15
@@ -3235,7 +3281,7 @@ class PatternAnalyzer:
             msg += "\n\n".join(actionable[:5])
             msg += "\n\nReview and approve changes manually."
             try:
-                self.notifier.send_notification(msg)
+                self.notifier.notify_alert(msg)
                 print("  [DETECTIVE] Alert sent to Telegram")
             except Exception as e:
                 print(f"  [DETECTIVE] Alert error: {e}")

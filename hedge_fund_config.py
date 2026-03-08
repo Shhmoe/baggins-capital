@@ -16,12 +16,12 @@ ENABLE_UPDOWN_MODULE = True       # Scalper is ACTIVE
 
 # SCALPER (Up/Down 15-min markets) — Ultra-Selective Mode
 UPDOWN_BET_SIZE = 2.0             # Flat $2 (was $5-15 score-based)
-UPDOWN_MIN_SCORE = 6.0            # Only HIGH confidence (was 4.0)
+UPDOWN_MIN_SCORE = 5.0            # Only HIGH confidence (was 4.0)
 UPDOWN_MAX_DAILY = 8              # Quality over quantity
 UPDOWN_DRAWDOWN_LIMIT = 10.0      # $10/day loss limit (was $15)
 UPDOWN_COOLDOWN_MINUTES = 45      # Cooldown after 1 loss (was 30 after 2)
 UPDOWN_COOLDOWN_AFTER_LOSSES = 1  # Pause after 1 loss (was 2)
-UPDOWN_UP_ONLY = True             # No DOWN bets (ties resolve UP = structural edge)
+UPDOWN_UP_ONLY = False             # No DOWN bets (ties resolve UP = structural edge)
 UPDOWN_MAX_PRICE = 0.45           # Only bet when UP side is cheap (was 0.48)
 UPDOWN_MIN_PRICE = 0.35           # Not too cheap/risky (was 0.30)
 UPDOWN_ASSETS = ['btc', 'eth']    # Focus on highest-volume assets      # Up/Down 15-min bets DISABLED (3W/5L, -$11.69)
@@ -138,6 +138,12 @@ CRYPTO_COINGECKO_IDS = {
 
 
 # =============================================================
-# SPORTS MODULE (disabled by default — add sports_analyst.py to enable)
+# SPORTS ANALYST CONFIG — Baggins' Buddy
 # =============================================================
-ENABLE_SPORTS_MODULE = False
+ENABLE_SPORTS_MODULE = True
+SPORTS_SCAN_INTERVAL = 900        # 15 min between scans
+SPORTS_BET_SIZE = 1.0             # $1 per sports bet (small, exploratory)
+SPORTS_MAX_DAILY = 3              # Max 3 sports bets per day
+SPORTS_MIN_EDGE = 0.10            # 10% edge minimum (if bookmaker odds available)
+SPORTS_MIN_CONFIDENCE = 55        # Minimum confidence score (0-100) to place bet
+SPORTS_FOCUS_EVENTS = ['ufc', 'boxing', 'nba_playoffs', 'nhl_playoffs', 'champions_league']

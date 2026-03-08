@@ -25,10 +25,7 @@ except ImportError:
     print("[!] anthropic SDK not installed - AI heartbeat disabled")
 
 from updown_trader import run_scalper_cycle
-try:
-    from sports_analyst import SportsAnalyst
-except ImportError:
-    SportsAnalyst = None
+from sports_analyst import SportsAnalyst
 from hedge_fund_config import *
 from performance_tracker import PerformanceTracker
 from bet_notifier import BetNotifier

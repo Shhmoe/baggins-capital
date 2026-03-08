@@ -31,17 +31,19 @@ Scans Polymarket for crypto price prediction markets (BTC, ETH, SOL, XRP, DOGE, 
 
 ### The Weather Analyst (`weather_agent.py`)
 A whole department in one file:
-- **The Weather Scout** — Scans Polymarket for daily temperature markets across US cities
+- **The Weather Scout** — Scans Polymarket for daily temperature markets across 16+ cities (US + international)
 - **The Meteorologist** — Pulls forecasts from 7 weather APIs (Open-Meteo, NOAA, WeatherAPI, OpenWeatherMap, Visual Crossing, Weatherbit, Pirate Weather)
 - **The Auditor** — Tracks each source's accuracy per city, adjusts credibility weights after every resolution
 - **The Statistician** — Calculates edge, picks YES/NO side, scores confidence 0-100
 - **The Historian** — 2-year temperature baselines for sigma calibration
 - **The Coach** — AI-powered strategy review, adjusts weights and recommends focus cities
 
-**Forecast Collection**: Every 30 minutes, the Meteorologist collects readings from all 7 APIs for every active city and stores them in the `forecast_snapshots` table. During betting windows, accumulated snapshot data is used — multiple readings per source, with drift and stability metrics. This builds a dataset so the system knows exactly which sources to trust for which cities.
+**v5.1 Strategy**: Threshold-first market selection. Above/below markets (60% WR historically) get priority. Single-degree exact temp markets (0% WR) are blocked entirely. Between X-Y range markets only allowed at 10x+ payout potential.
+
+**Forecast Collection**: Every 30 minutes, the Meteorologist collects readings from all 7 APIs for every active city and stores them in the `forecast_snapshots` table. During betting windows, accumulated snapshot data is used — multiple readings per source, with drift and stability metrics. This builds a dataset so the system knows exactly which sources to trust for which cities. API calls are staggered with 1.5s delays to avoid rate limiting.
 
 ### The Scalper (`updown_trader.py`)
-Trades BTC/ETH "Up or Down" 15-minute markets. Fires at :08, :23, :38, :53 each hour. Ultra-selective: UP-only (ties resolve UP = structural edge), flat $2 bets, minimum score 6.0, max 8 bets/day, $10 daily drawdown limit, 45-min cooldown after any loss.
+Trades BTC/ETH "Up or Down" 15-minute markets. Fires at :08, :23, :38, :53 each hour. Bets both UP and DOWN when confident. Flat $2 bets, minimum score 5.0, max 8 bets/day, $10 daily drawdown limit, 45-min cooldown after any loss. Scoring: MA alignment (+/-2), candle direction (+/-1.5), RSI (+/-1), low volatility (+1), volume multiplier (x1.2). Max possible ~7.2.
 
 ---
 
@@ -150,7 +152,7 @@ WEATHER_MAX_DAILY = 30       # max bets per day
 # Scalper (15-min markets)
 SCALPER_BET_SIZE = 2.0       # $ per scalp
 SCALPER_MAX_DAILY = 8        # max bets per day
-SCALPER_MIN_SCORE = 6.0      # minimum signal score (0-10)
+SCALPER_MIN_SCORE = 5.0      # minimum signal score (max ~7.2)
 ```
 
 ### 5. Run it
