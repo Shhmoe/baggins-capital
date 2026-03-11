@@ -28,14 +28,14 @@ import time
 import math
 import argparse
 import requests
-import sqlite3
 from datetime import datetime, timedelta, timezone
 
+from company_clock import now_et, is_weekend, in_hours, current_hour_et, current_day_name, status as clock_status
 from hedge_fund_config import (
     ENABLE_UPDOWN_MODULE, UPDOWN_BET_SIZE, UPDOWN_MIN_SCORE,
     UPDOWN_MAX_DAILY, UPDOWN_DRAWDOWN_LIMIT, UPDOWN_COOLDOWN_MINUTES,
     UPDOWN_COOLDOWN_AFTER_LOSSES, UPDOWN_UP_ONLY, UPDOWN_MAX_PRICE,
-    UPDOWN_MIN_PRICE, UPDOWN_ASSETS
+    UPDOWN_MIN_PRICE, UPDOWN_ASSETS, UPDOWN_MAX_CONCURRENT
 )
 
 # ============================================================
@@ -59,7 +59,7 @@ ASSET_SLUGS = {
 }
 
 DEFAULT_BUDGET = 20.0
-DEFAULT_BET_SIZE = UPDOWN_BET_SIZE  # From config (flat $2)
+DEFAULT_BET_SIZE = UPDOWN_BET_SIZE  # From config (base size, actual scales $5-$10)
 DEFAULT_HOURS = 1
 DEFAULT_ASSETS = ["btc"]
 MIN_SCORE_DEFAULT = UPDOWN_MIN_SCORE  # From config (6.0 = HIGH only)
@@ -70,7 +70,8 @@ LOCK_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), '.updown_loc
 # v3.0 FILTERS (from fathom-builds reference)
 # ============================================================
 BLACKOUT_HOURS_ET = [11, 12, 13]  # 11 AM - 2 PM ET (12.5% WR historically)
-MAX_SCORE = 5.0                   # Scores >5 = momentum trap (33% WR)
+BLACKOUT_WEEKENDS = True          # Sat+Sun blackout (18% WR historically)
+MAX_SCORE = 6.5                   # Scores >5 = momentum trap (33% WR)
 DRAWDOWN_LIMIT = UPDOWN_DRAWDOWN_LIMIT  # From config ($10)
 COOLDOWN_MINUTES = UPDOWN_COOLDOWN_MINUTES  # From config (45 min)
 DOWN_MIN_SCORE = -4.0             # DOWN needs score <= -4
@@ -289,19 +290,15 @@ def analyze(candles, min_score=MIN_SCORE_DEFAULT):
 
 def get_current_window_start():
     """Get the start of the current 15-min window in ET, return as UTC epoch."""
-    now_utc = datetime.now(timezone.utc)
-    # ET = UTC - 5 (simplified, ignoring DST for now)
-    et_offset = timedelta(hours=-5)
-    now_et = now_utc + et_offset
+    et_now = now_et()
 
     # Round down to nearest 15-min boundary
-    minute = now_et.minute
+    minute = et_now.minute
     window_minute = (minute // 15) * 15
-    window_start_et = now_et.replace(minute=window_minute, second=0, microsecond=0)
+    window_start_et = et_now.replace(minute=window_minute, second=0, microsecond=0)
 
-    # Convert back to UTC epoch
-    window_start_utc = window_start_et - et_offset
-    return int(window_start_utc.timestamp())
+    # Convert to UTC epoch
+    return int(window_start_et.astimezone(timezone.utc).timestamp())
 
 
 def find_market(asset, timeframe="15m"):
@@ -425,19 +422,28 @@ def cleanup_locks(max_age_hours=2):
 # ============================================================
 
 def place_bet_via_bankr(direction, bet_size, market_title, bankr):
-    """Place a bet on Polymarket via Bankr API."""
+    """Place a bet on Polymarket via Bankr API (uses bankr.place_bet)."""
     side = "Up" if direction == "BET_UP" else "Down"
-    prompt = (
-        f'Buy ${bet_size:.2f} of {side} shares for "{market_title}" '
-        f'on Polymarket. Execute the trade.'
-    )
 
     print(f"  [BANKER] Placing ${bet_size:.2f} on {side}...")
     try:
-        result = bankr._run_prompt(prompt)
+        result = bankr.place_bet(
+            market_title=market_title,
+            side=side,
+            amount=bet_size,
+        )
         if result.get("success"):
             trade_id = result.get("trade_id", "")
             print(f"  [BANKER] Submitted. Trade ID: {trade_id or 'pending'}")
+            # Verify bet execution
+            try:
+                verify_result = bankr.verify_bet_execution(market_title, side)
+                if verify_result.get("verified"):
+                    print(f"  [VERIFIED] Scalper bet confirmed in Bankr positions")
+                else:
+                    print(f"  [WARN] Scalper bet unverified: {verify_result.get('reason', 'unknown')} -- logging anyway")
+            except Exception as ve:
+                print(f"  [WARN] Scalper verification failed: {ve} -- logging anyway")
             return {"success": True, "trade_id": trade_id, "response": result.get("response", "")}
         else:
             print(f"  [BANKER] Error: {result.get('error', 'unknown')}")
@@ -451,30 +457,71 @@ def place_bet_via_bankr(direction, bet_size, market_title, bankr):
 # DB LOGGING
 # ============================================================
 
-def log_updown_bet(db_path, asset, direction, score, bet_size, market_title, trade_id=None, balance_before=None, real_odds=None):
-    """Log an up/down bet to the bets table."""
+def log_updown_bet(db_path, asset, direction, score, bet_size, market_title, trade_id=None, balance_before=None, real_odds=None,
+                     signal_data=None):
+    """Log an up/down bet via The Archivist with full decision snapshot."""
     try:
-        conn = sqlite3.connect(db_path, timeout=30)
-        conn.execute("""
-            INSERT INTO bets (timestamp, market_id, market_title, category, side, amount,
-                odds, confidence_score, edge, reasoning, status, cycle_type, trade_id, balance_before)
-            VALUES (?, ?, ?, 'crypto', ?, ?, ?, ?, ?, ?, 'pending', 'updown', ?, ?)
-        """, (
-            datetime.now(timezone.utc).isoformat(),
-            f"updown-{asset}-15m-{int(time.time())}",
-            market_title,
-            "yes" if direction == "BET_UP" else "no",
-            bet_size,
-            real_odds if real_odds else 0.50,
-            abs(int(score * 20)),  # Convert score to 0-100 confidence
-            abs(score) / 10,  # Score as edge
-            f"UpDown {asset.upper()} score={score:.1f} ({direction})",
-            trade_id or "",
-            balance_before,
-        ))
-        conn.commit()
-        bet_id = conn.execute("SELECT last_insert_rowid()").fetchone()[0]
-        conn.close()
+        from data_intake import DataIntake
+        from db_writer import DBWriter
+        _intake = DataIntake(db_path)
+        archivist = DBWriter(db_path)
+
+        side = "yes" if direction == "BET_UP" else "no"
+        confidence = abs(int(score * 20))
+        edge = abs(score) / 10
+        market_id = f"updown-{asset}-15m-{int(time.time())}"
+
+        # Build decision snapshot from signal data
+        sig = signal_data or {}
+        decision_snapshot = {
+            "raw_data": {
+                "asset": asset,
+                "current_price": sig.get("price"),
+                "rsi": sig.get("rsi"),
+                "volatility": sig.get("volatility"),
+                "candle_direction_ratio": sig.get("candle_ratio"),
+                "volume_trend": sig.get("volume_trend"),
+                "hourly_trend": sig.get("hourly_trend"),
+                "market_odds": real_odds,
+            },
+            "modifiers": {
+                "ma_alignment": sig.get("ma_alignment"),
+                "momentum_indicators": sig.get("indicators", []),
+            },
+            "decision": {
+                "score": score,
+                "confidence": confidence,
+                "direction": direction,
+                "edge": edge,
+                "side": side,
+            },
+            "strategy": {
+                "bet_type": "UPDOWN",
+                "asset": asset.upper(),
+                "window_15m": True,
+            },
+        }
+
+        bet_id = _intake.validate_and_write_bet(
+            market_id=market_id,
+            market_title=market_title,
+            category="crypto",
+            side=side,
+            amount=bet_size,
+            odds=real_odds if real_odds else 0.50,
+            confidence_score=confidence,
+            edge=edge,
+            reasoning=f"UpDown {asset.upper()} score={score:.1f} ({direction})",
+            balance_before=balance_before,
+            cycle_type="updown",
+            bet_type="UPDOWN",
+            format_type="updown",
+            decision_snapshot=decision_snapshot,
+        )
+
+        if bet_id and trade_id:
+            archivist.set_trade_id(bet_id, trade_id)
+
         return bet_id
     except Exception as e:
         print(f"  [SCALPER] Log error: {e}")
@@ -503,8 +550,9 @@ class SessionTracker:
         self._ensure_table()
 
     def _ensure_table(self):
-        conn = sqlite3.connect(self.db_path, timeout=30)
-        conn.execute("""
+        from db_writer import DBWriter
+        _arch = DBWriter(self.db_path)
+        _arch.execute("""
             CREATE TABLE IF NOT EXISTS updown_sessions (
                 id INTEGER PRIMARY KEY AUTOINCREMENT,
                 started_at TEXT NOT NULL,
@@ -526,9 +574,7 @@ class SessionTracker:
                 net_pnl REAL DEFAULT 0.0,
                 roi REAL DEFAULT 0.0
             )
-        """)
-        conn.commit()
-        conn.close()
+        """, commit=True)
 
     def start(self, hours, assets, budget, bet_size, min_score, dry_run):
         """Start a new session. Returns session_id."""
@@ -536,32 +582,31 @@ class SessionTracker:
         self.budget = budget or 0.0
         self.total_wagered = 0.0
         self.total_returned = 0.0
-        conn = sqlite3.connect(self.db_path, timeout=30)
-        conn.execute("""
+        from db_writer import DBWriter
+        _arch = DBWriter(self.db_path)
+        _arch.execute("""
             INSERT INTO updown_sessions (started_at, status, runtime_hours, assets,
                 budget, bet_size, min_score, dry_run)
             VALUES (?, 'running', ?, ?, ?, ?, ?, ?)
         """, (self.started_at, hours, assets, budget, bet_size, min_score,
-              1 if dry_run else 0))
-        conn.commit()
-        self.session_id = conn.execute("SELECT last_insert_rowid()").fetchone()[0]
-        conn.close()
+              1 if dry_run else 0), commit=True)
+        row = _arch.fetchone("SELECT last_insert_rowid()")
+        self.session_id = row[0] if row else None
         print(f"[SCALPER] Started session #{self.session_id}")
         return self.session_id
 
     def log_cycle(self, bets_placed, amount_spent):
         """Update session after a cycle completes."""
         self.total_wagered += amount_spent
-        conn = sqlite3.connect(self.db_path, timeout=30)
-        conn.execute("""
+        from db_writer import DBWriter
+        _arch = DBWriter(self.db_path)
+        _arch.execute("""
             UPDATE updown_sessions
             SET cycles_run = cycles_run + 1,
                 bets_placed = bets_placed + ?,
                 total_wagered = ?
             WHERE id = ?
-        """, (bets_placed, self.total_wagered, self.session_id))
-        conn.commit()
-        conn.close()
+        """, (bets_placed, self.total_wagered, self.session_id), commit=True)
 
     def heartbeat(self):
         """Check resolved bets, return effective budget remaining.
@@ -573,28 +618,28 @@ class SessionTracker:
         if not self.started_at or not self.budget:
             return None
 
-        conn = sqlite3.connect(self.db_path, timeout=30)
-        conn.row_factory = sqlite3.Row
+        from db_writer import DBWriter
+        _arch = DBWriter(self.db_path)
 
         # Check resolved bets from this session
-        resolved = conn.execute("""
+        resolved = _arch.fetchall("""
             SELECT won, profit, amount FROM bets
             WHERE cycle_type = 'updown' AND status = 'resolved'
             AND timestamp >= ?
-        """, (self.started_at,)).fetchall()
+        """, (self.started_at,))
 
         # Check pending count
-        pending = conn.execute("""
+        _prow = _arch.fetchone("""
             SELECT COUNT(*) FROM bets
             WHERE cycle_type = 'updown' AND status = 'pending'
             AND timestamp >= ?
-        """, (self.started_at,)).fetchone()[0]
-        conn.close()
+        """, (self.started_at,))
+        pending = _prow[0] if _prow else 0
 
-        wins = sum(1 for r in resolved if r['won'])
-        losses = sum(1 for r in resolved if not r['won'])
+        wins = sum(1 for r in resolved if r[0])
+        losses = sum(1 for r in resolved if not r[0])
         self.total_returned = sum(
-            (r['amount'] + (r['profit'] or 0)) for r in resolved if r['won']
+            (r[2] + (r[1] or 0)) for r in resolved if r[0]
         )
 
         effective = self.budget - self.total_wagered + self.total_returned
@@ -616,45 +661,43 @@ class SessionTracker:
         if not self.session_id:
             return
 
-        conn = sqlite3.connect(self.db_path, timeout=30)
-        conn.row_factory = sqlite3.Row
-        rows = conn.execute("""
+        from db_writer import DBWriter
+        _arch = DBWriter(self.db_path)
+        rows = _arch.fetchall("""
             SELECT won, profit, amount, status FROM bets
             WHERE cycle_type = 'updown' AND timestamp >= ?
-        """, (self.started_at,)).fetchall()
+        """, (self.started_at,))
 
         # Also get cycles_run from session record
-        session_row = conn.execute(
+        session_row = _arch.fetchone(
             "SELECT cycles_run, assets, runtime_hours FROM updown_sessions WHERE id = ?",
             (self.session_id,)
-        ).fetchone()
+        )
 
-        wins = sum(1 for r in rows if r['status'] == 'resolved' and r['won'])
-        losses = sum(1 for r in rows if r['status'] == 'resolved' and not r['won'])
-        pending = sum(1 for r in rows if r['status'] == 'pending')
+        wins = sum(1 for r in rows if r[3] == 'resolved' and r[0])
+        losses = sum(1 for r in rows if r[3] == 'resolved' and not r[0])
+        pending = sum(1 for r in rows if r[3] == 'pending')
         self.total_returned = sum(
-            (r['amount'] + (r['profit'] or 0)) for r in rows
-            if r['status'] == 'resolved' and r['won']
+            (r[2] + (r[1] or 0)) for r in rows
+            if r[3] == 'resolved' and r[0]
         )
         net_pnl = self.total_returned - self.total_wagered
         roi = (net_pnl / self.total_wagered * 100) if self.total_wagered > 0 else 0.0
 
         ended_at = datetime.now(timezone.utc).isoformat()
-        conn.execute("""
+        _arch.execute("""
             UPDATE updown_sessions
             SET ended_at = ?, status = ?, bets_won = ?, bets_lost = ?,
                 bets_pending = ?, total_returned = ?, net_pnl = ?, roi = ?
             WHERE id = ?
         """, (ended_at, status, wins, losses, pending,
-              self.total_returned, net_pnl, roi, self.session_id))
-        conn.commit()
-        conn.close()
+              self.total_returned, net_pnl, roi, self.session_id), commit=True)
 
         # Summary card
         total_bets = wins + losses + pending
-        cycles = session_row['cycles_run'] if session_row else '?'
-        assets_str = (session_row['assets'] or '?').upper() if session_row else '?'
-        hours = session_row['runtime_hours'] if session_row else '?'
+        cycles = session_row[0] if session_row else '?'
+        assets_str = (session_row[1] or '?').upper() if session_row else '?'
+        hours = session_row[2] if session_row else '?'
 
         print(f"\n{'='*60}")
         print(f"SESSION #{self.session_id} COMPLETE")
@@ -673,12 +716,15 @@ class SessionTracker:
     def print_history(db_path, limit=10):
         """Print past session history from DB."""
         try:
-            conn = sqlite3.connect(db_path, timeout=30)
-            conn.row_factory = sqlite3.Row
-            rows = conn.execute("""
-                SELECT * FROM updown_sessions ORDER BY id DESC LIMIT ?
-            """, (limit,)).fetchall()
-            conn.close()
+            from db_writer import DBWriter
+            _arch = DBWriter(db_path)
+            rows = _arch.fetchall("""
+                SELECT id, started_at, ended_at, status, runtime_hours, assets,
+                       budget, bet_size, min_score, dry_run, cycles_run,
+                       bets_placed, bets_won, bets_lost, bets_pending,
+                       total_wagered, total_returned, net_pnl, roi
+                FROM updown_sessions ORDER BY id DESC LIMIT ?
+            """, (limit,))
         except Exception:
             print("No session history found (table may not exist yet).")
             return
@@ -693,16 +739,16 @@ class SessionTracker:
               f"{'Bets':>4} | {'W/L/P':7} | {'Net P&L':>8} | {'ROI':>7} | Status")
         print(f"{'-'*95}")
         for r in reversed(rows):
-            date = r['started_at'][:10] if r['started_at'] else '?'
-            assets = (r['assets'] or '?').upper()[:7]
-            budget = f"${r['budget']:.2f}" if r['budget'] else '  n/a'
-            bets = r['bets_placed'] or 0
-            w, l, p = r['bets_won'] or 0, r['bets_lost'] or 0, r['bets_pending'] or 0
+            date = r[1][:10] if r[1] else '?'
+            assets = (r[5] or '?').upper()[:7]
+            budget = f"${r[6]:.2f}" if r[6] else '  n/a'
+            bets = r[11] or 0
+            w, l, p = r[12] or 0, r[13] or 0, r[14] or 0
             wlp = f"{w}/{l}/{p}"
-            pnl = f"${r['net_pnl']:+.2f}" if r['net_pnl'] else ' $0.00'
-            roi = f"{r['roi']:+.1f}%" if r['roi'] else '  0.0%'
-            status = r['status'] or '?'
-            print(f"{r['id']:>3} | {date:10} | {assets:7} | {budget:>7} | "
+            pnl = f"${r[17]:+.2f}" if r[17] else ' $0.00'
+            roi = f"{r[18]:+.1f}%" if r[18] else '  0.0%'
+            status = r[3] or '?'
+            print(f"{r[0]:>3} | {date:10} | {assets:7} | {budget:>7} | "
                   f"{bets:>4} | {wlp:7} | {pnl:>8} | {roi:>7} | {status}")
         print(f"{'='*95}")
 
@@ -712,24 +758,24 @@ class SessionTracker:
 # ============================================================
 
 def is_blackout_hour():
-    """Check if current ET hour is in blackout window."""
-    now_utc = datetime.now(timezone.utc)
-    et_offset = timedelta(hours=-5)
-    now_et = now_utc + et_offset
-    return now_et.hour in BLACKOUT_HOURS_ET, now_et.hour
+    """Check if current ET hour is in blackout window or weekend."""
+    if BLACKOUT_WEEKENDS and is_weekend():
+        return True, f"weekend ({current_day_name()})"
+    h = current_hour_et()
+    return h in BLACKOUT_HOURS_ET, h
 
 
 def check_drawdown(db_path):
     """Check today's net P&L. Returns (is_over_limit, daily_pnl)."""
     try:
-        conn = sqlite3.connect(db_path, timeout=30)
+        from db_writer import DBWriter
+        _arch = DBWriter(db_path)
         today = datetime.now(timezone.utc).strftime("%Y-%m-%d")
-        rows = conn.execute("""
+        rows = _arch.fetchall("""
             SELECT won, profit, amount FROM bets
             WHERE cycle_type = 'updown' AND status = 'resolved'
             AND timestamp LIKE ?
-        """, (f"{today}%",)).fetchall()
-        conn.close()
+        """, (f"{today}%",))
         if not rows:
             return False, 0.0
         pnl = sum(r[1] or 0 for r in rows)
@@ -741,13 +787,13 @@ def check_drawdown(db_path):
 def check_cooldown(db_path):
     """Check if last 2 updown bets were losses. Returns (in_cooldown, minutes_left)."""
     try:
-        conn = sqlite3.connect(db_path, timeout=30)
-        rows = conn.execute("""
+        from db_writer import DBWriter
+        _arch = DBWriter(db_path)
+        rows = _arch.fetchall("""
             SELECT won, resolved_at FROM bets
             WHERE cycle_type = 'updown' AND status = 'resolved'
             ORDER BY id DESC LIMIT 2
-        """).fetchall()
-        conn.close()
+        """)
         if len(rows) < 2:
             return False, 0
         # Both losses?
@@ -859,22 +905,19 @@ def run_cycle(assets, bet_size, bankr, dry_run=False, min_score=MIN_SCORE_DEFAUL
         if signal["decision"] == "NO_BET":
             continue
 
-        # Filter 3: UP-only mode (ties resolve UP = structural edge)
-        if UPDOWN_UP_ONLY and signal["decision"] == "BET_DOWN":
-            print(f"  [{asset.upper()}] SKIP - UP-only mode, ignoring DOWN signal")
-            continue
-
-        # Filter 4: DOWN strict qualification (if DOWN is enabled)
+        # Direction decided by score alone: positive = UP, negative = DOWN
+        # Score threshold (>=5.0) applies equally to both directions
         if signal["decision"] == "BET_DOWN":
-            qualified, down_reason = qualify_down_bet(signal, candles)
-            if not qualified:
-                print(f"  [{asset.upper()}] SKIP DOWN - {down_reason}")
-                continue
-            else:
-                print(f"    - {down_reason}")
+            print(f"  [{asset.upper()}] DOWN signal (score {signal['score']:.1f})")
 
-        # Flat bet sizing from config (no score-based scaling)
-        actual_bet = UPDOWN_BET_SIZE
+        # Tiered bet sizing: $2/$3/$5 by score
+        score_abs = abs(signal['score'])
+        if score_abs >= 6.0:
+            actual_bet = 5.0
+        elif score_abs >= 5.5:
+            actual_bet = 3.0
+        else:
+            actual_bet = 2.0
 
         # Cap to budget remaining
         if budget_remaining is not None:
@@ -884,7 +927,7 @@ def run_cycle(assets, bet_size, bankr, dry_run=False, min_score=MIN_SCORE_DEFAUL
                 continue
             actual_bet = min(actual_bet, left)
 
-        print(f"  [{asset.upper()}] Bet sized: ${actual_bet:.0f} (score {abs(signal['score']):.1f})")
+        print(f"  [{asset.upper()}] Bet: ${actual_bet:.2f} (score {abs(signal['score']):.1f})")
 
         # Find market
         market = find_market(asset)
@@ -907,10 +950,23 @@ def run_cycle(assets, bet_size, bankr, dry_run=False, min_score=MIN_SCORE_DEFAUL
             print(f"  [{asset.upper()}] Could not read token prices, using 0.50 default")
 
         # Price filter: only bet when our side is cheap (mispriced)
-        # 35-48c = good value, >50c = we're the favorite (no edge), <30c = too risky
+        # 35-45c = good value, >45c = too expensive, <35c = too risky
+        # KEY: If our signal side is too expensive, the OTHER side is cheap.
+        # Flip to the cheap side — the market is giving us value on the contrarian bet.
         if our_price > UPDOWN_MAX_PRICE:
-            print(f"  [{asset.upper()}] SKIP - our side ({side_label}) at {our_price:.2f}c, too expensive (need <={UPDOWN_MAX_PRICE})")
-            continue
+            # Our signal side is expensive — check if opposite side is in value zone
+            opp_label = "Down" if side_label == "Up" else "Up"
+            opp_price = token_prices.get(opp_label, 0.50) if token_prices else 0.50
+            if UPDOWN_MIN_PRICE <= opp_price <= UPDOWN_MAX_PRICE:
+                print(f"  [{asset.upper()}] FLIP - {side_label} too expensive ({our_price:.2f}), {opp_label} is cheap ({opp_price:.2f})")
+                # Flip direction
+                side_label = opp_label
+                side = side_label.upper()
+                direction = "BET_UP" if side == "UP" else "BET_DOWN"
+                our_price = opp_price
+            else:
+                print(f"  [{asset.upper()}] SKIP - {side_label} at {our_price:.2f}c too expensive, {opp_label} at {opp_price:.2f}c not in range")
+                continue
         if our_price < UPDOWN_MIN_PRICE:
             print(f"  [{asset.upper()}] SKIP - our side ({side_label}) at {our_price:.2f}c, too cheap/risky (need >={UPDOWN_MIN_PRICE})")
             continue
@@ -923,6 +979,39 @@ def run_cycle(assets, bet_size, bankr, dry_run=False, min_score=MIN_SCORE_DEFAUL
             amount_spent += actual_bet
             continue
 
+        # V3.1: Risk Manager assessment
+        if risk_manager:
+            bet_dict = {
+                'category': 'updown',
+                'side': direction,
+                'amount': actual_bet,
+                'market_id': market.get('id', market.get('condition_id', '')),
+                'market_title': market.get('title', ''),
+            }
+            risk_ok, risk_level, risk_warnings = risk_manager.assess(bet_dict)
+            if risk_warnings:
+                for w in risk_warnings:
+                    print(f"  [RISK MANAGER] {w}")
+            if not risk_ok:
+                print(f"  [RISK MANAGER] BLOCKED: {risk_warnings}")
+                continue
+
+        # V3.1: Compliance pre-flight
+        if compliance:
+            comp_dict = {
+                'category': 'updown',
+                'market_id': market.get('id', market.get('condition_id', '')),
+                'market_title': market.get('title', ''),
+                'amount': actual_bet,
+            }
+            approved, reason, comp_warnings = compliance.pre_flight(comp_dict)
+            if comp_warnings:
+                for w in comp_warnings:
+                    print(f"  [COMPLIANCE] {w}")
+            if not approved:
+                print(f"  [COMPLIANCE] REJECTED: {reason}")
+                continue
+
         # Place bet via Bankr
         result = place_bet_via_bankr(direction, actual_bet, market["title"], bankr)
         if result.get("success"):
@@ -930,18 +1019,29 @@ def run_cycle(assets, bet_size, bankr, dry_run=False, min_score=MIN_SCORE_DEFAUL
             # Get last known balance for tracking
             _bal = None
             try:
-                _bconn = sqlite3.connect(DB_PATH, timeout=30)
-                _row = _bconn.execute(
+                from db_writer import DBWriter
+                _arch = DBWriter(DB_PATH)
+                _row = _arch.fetchone(
                     "SELECT available_balance FROM portfolio_snapshots ORDER BY id DESC LIMIT 1"
-                ).fetchone()
+                )
                 if _row:
                     _bal = _row[0]
-                _bconn.close()
             except Exception:
                 pass
             log_updown_bet(DB_PATH, asset, direction, signal["score"],
                           actual_bet, market["title"], result.get("trade_id"),
-                          balance_before=_bal, real_odds=our_price)
+                          balance_before=_bal, real_odds=our_price,
+                          signal_data={
+                              "price": signal.get("price"),
+                              "rsi": signal.get("rsi"),
+                              "volatility": signal.get("volatility"),
+                              "candle_ratio": signal.get("candle_ratio"),
+                              "volume_trend": signal.get("volume_trend"),
+                              "hourly_trend": signal.get("hourly_trend"),
+                              "ma_alignment": signal.get("ma_alignment"),
+                              "indicators": signal.get("indicators", []),
+                              "confidence": signal.get("confidence"),
+                          })
             bets_placed += 1
             amount_spent += actual_bet
             print(f"  [{asset.upper()}] BET PLACED: ${actual_bet:.2f} {side} @ {our_price:.2f}")
@@ -965,7 +1065,7 @@ _scalper_state = {
     "bankr_instance": None,
 }
 
-def run_scalper_cycle(bankr=None, wallet=None, dry_run=False):
+def run_scalper_cycle(bankr=None, wallet=None, dry_run=False, risk_manager=None, compliance=None, intel_package=None):
     """Run one Scalper cycle — called by Manager every 2 min.
     Checks if we're in a 15-min window and conditions are met."""
     import pytz
@@ -987,12 +1087,32 @@ def run_scalper_cycle(bankr=None, wallet=None, dry_run=False):
         return
 
     # Max daily bets check
-    if state["daily_bets"] >= UPDOWN_MAX_DAILY:
+    # DB-based daily bet count (survives restarts)
+    try:
+        from db_writer import DBWriter
+        _arch = DBWriter(DB_PATH)
+        _today = datetime.now(timezone.utc).strftime("%Y-%m-%d")
+        _row = _arch.fetchone("SELECT COUNT(*) FROM bets WHERE cycle_type='updown' AND timestamp LIKE ?", (f"{_today}%",))
+        _count = _row[0] if _row else 0
+    except Exception:
+        _count = 0
+    if _count >= UPDOWN_MAX_DAILY:
         return
 
+    # Concurrent position check
+    try:
+        _open = _arch.fetchone("SELECT COUNT(*) FROM bets WHERE cycle_type='updown' AND status != 'resolved'")
+        _open_count = _open[0] if _open else 0
+        if _open_count >= UPDOWN_MAX_CONCURRENT:
+            print(f"[SCALPER] Max concurrent positions reached ({_open_count}/{UPDOWN_MAX_CONCURRENT})")
+            return
+    except Exception:
+        pass
+
     # Drawdown check
-    if state["daily_pnl"] <= -UPDOWN_DRAWDOWN_LIMIT:
-        print(f"[SCALPER] Daily drawdown limit hit (${state['daily_pnl']:+.2f})")
+    over_limit, daily_pnl = check_drawdown(DB_PATH)
+    if over_limit:
+        print(f"[SCALPER] Daily drawdown limit hit (${daily_pnl:+.2f})")
         return
 
     # Cooldown check (1 loss = 45 min pause)
@@ -1004,14 +1124,10 @@ def run_scalper_cycle(bankr=None, wallet=None, dry_run=False):
             state["consecutive_losses"] = 0
             state["last_loss_time"] = None
 
-    # Blackout hours check (ET)
-    try:
-        et = pytz.timezone('US/Eastern')
-        now_et = datetime.now(et)
-        if now_et.hour in BLACKOUT_HOURS_ET:
-            return
-    except Exception:
-        pass
+    # Blackout check (hours + weekends)
+    in_blackout, reason = is_blackout_hour()
+    if in_blackout:
+        return
 
     # Check if we're near a 15-min window (:08, :23, :38, :53)
     now = datetime.now(timezone.utc)
@@ -1204,7 +1320,7 @@ def main():
             # v3.0: Blackout hour check
             in_blackout, et_hour = is_blackout_hour()
             if in_blackout:
-                print(f"\n[SCALPER] ET hour {et_hour}:00 is in blackout {BLACKOUT_HOURS_ET} — skipping cycle")
+                print(f"\n[SCALPER] Blackout: {et_hour} — skipping cycle")
                 time.sleep(60)
                 continue
 

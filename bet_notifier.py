@@ -123,24 +123,33 @@ Win Rate: {(wins/total_bets)*100:.1f}%
         return self._send_telegram(alert_msg)
 
     def _send_telegram(self, message):
-        """Send message via Telegram Bot API."""
+        """Queue message for CEO Baggins to send via Telegram."""
+        import json
+        queue_path = os.path.join(os.getenv('SHARED_DIR', os.path.expanduser('~/shared')), 'notification_queue.json')
         try:
-            url = f"https://api.telegram.org/bot{self.bot_token}/sendMessage"
-            payload = {
-                "chat_id": self.chat_id,
-                "text": message,
-            }
-            response = requests.post(url, json=payload, timeout=10)
+            # Read existing queue
+            try:
+                with open(queue_path, 'r') as f:
+                    queue = json.load(f)
+            except (FileNotFoundError, json.JSONDecodeError):
+                queue = []
 
-            if response.status_code == 200:
-                print(f"[+] Telegram notification sent")
-                return True
-            else:
-                print(f"[-] Telegram error: {response.status_code} - {response.text[:200]}")
-                return False
+            # Add new notification
+            queue.append({
+                'timestamp': datetime.now().isoformat(),
+                'message': message.strip(),
+                'source': 'hedge-fund',
+            })
 
+            # Write back (keep max 50 pending)
+            queue = queue[-50:]
+            with open(queue_path, 'w') as f:
+                json.dump(queue, f)
+
+            print(f"[+] Notification queued for CEO Baggins")
+            return True
         except Exception as e:
-            print(f"[-] Telegram error: {e}")
+            print(f"[-] Queue error: {e}")
             return False
 
 

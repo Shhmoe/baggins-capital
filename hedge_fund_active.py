@@ -1,19 +1,31 @@
 """
-Active Hedge Fund Agent - Polymarket Crypto
-Prediction market trader focused on crypto markets on Polymarket
-Momentum-based edge evaluation using CoinGecko price data
+The Manager — Executive Department
+Baggins Capital V3
 
-DATA SOURCES:
-- Polymarket Gamma API for crypto prediction markets
-- CoinGecko for real-time crypto prices (free, no key)
-- Bankr API for trade execution
+Orchestrates every department. Decides when each employee runs.
+Triggers daily reset at 22:00 UTC. Only authority to approve
+and apply Detective findings.
+
+V3 Workflow (10-step Manager cycle):
+  1. Query CFO: available capital, deployment %, per-bet max, position count
+  2. Query Risk Manager: active circuit breakers, HIGH severity warnings
+  3. Check Compliance blocklist for new entries since last cycle
+  4. Check Market Pulse for real-time alerts (CB proximity, cap exhaustion, exposure)
+  5. Determine eligible departments (time windows, daily caps, active warnings)
+  6. Circuit-breaker-active departments: log suppression, skip
+  7. Signal eligible Liaisons to pre-pull intelligence packages
+  8. Run eligible departments: Liaison → Risk → CFO → Dept Intelligence → Compliance → Banker
+  9. Review detective_findings for pending findings awaiting approval
+  10. At 22:00 UTC daily reset: archive pulse, confirm Historian, reset counters
+
+Department: Executive
+Reports to: — (Top of org)
 """
 
 import os
 import time
 import random
 import json
-import sqlite3
 from datetime import datetime, timedelta
 from dotenv import load_dotenv
 
@@ -26,13 +38,32 @@ except ImportError:
 
 from updown_trader import run_scalper_cycle
 from sports_analyst import SportsAnalyst
+from company_clock import now_utc, now_et, status as clock_status, get_context
 from hedge_fund_config import *
-from performance_tracker import PerformanceTracker
+from archivist import Archivist
+from compliance import ComplianceOfficer
+from risk_manager import RiskManager
+from historian import Historian
 from bet_notifier import BetNotifier
 from bankr import BankrExecutor
 from polymarket_crypto import CryptoMarketScanner
 from wallet_coordinator import WalletCoordinator
 from bankr import BetResolver
+
+# V3 Modules
+from company_clock import CompanyClock
+from db_writer import DBWriter
+from db_reader import DBReader
+from db_steward import DBSteward
+from data_intake import DataIntake
+from intel_crypto import CryptoIntel
+from intel_scalper import ScalperIntel
+from intel_weather import WeatherIntel
+from intel_sports import SportsIntel
+from market_pulse import MarketPulse
+from detective import Detective
+from signals_library import SignalsLibrary
+from market_scout import MarketScout
 
 try:
     from weather_agent import WeatherAgent, PatternAnalyzer
@@ -53,30 +84,76 @@ load_dotenv()
 
 
 class ActiveHedgeFundAgent:
-    """Crypto prediction market hedge fund agent on Polymarket."""
+    """The Manager — V3 orchestrator for all 24 employees."""
 
     def __init__(self, dry_run=True, starting_balance=100.0):
         self.dry_run = dry_run
 
-        # Components
-        self.tracker = PerformanceTracker()
+        # ══════════════════════════════════════════════════════════════
+        # CORE EMPLOYEES (existing)
+        # ══════════════════════════════════════════════════════════════
+        self.tracker = Archivist()
         self.notifier = BetNotifier()
-
-        # Data source -- crypto
         self.crypto_scanner = CryptoMarketScanner()
-
-        # Trade executor
         self.bankr = BankrExecutor(dry_run=dry_run)
-
-        # Wallet Coordinator -- single source of truth for balance + positions
         self.wallet = WalletCoordinator(self.bankr, self.tracker, starting_balance, dry_run)
 
-        # Weather module
+        # ══════════════════════════════════════════════════════════════
+        # V3 EMPLOYEES — Data & Analytics
+        # ══════════════════════════════════════════════════════════════
+        self.clock = CompanyClock()
+        self.db_writer = DBWriter(self.tracker.db_path)
+        self.db_reader = DBReader(self.tracker.db_path)
+        self.db_steward = DBSteward(self.tracker.db_path)
+        self.data_intake = DataIntake(self.tracker.db_path)
+        self.pulse = MarketPulse(self.tracker.db_path)
+        self.scout = MarketScout(self.tracker.db_path)
+        self._scout_queues = {}
+        self.detective = Detective(self.tracker.db_path)
+        self.signals = SignalsLibrary(self.tracker.db_path)
+
+        # ══════════════════════════════════════════════════════════════
+        # V3 EMPLOYEES — Intelligence Liaisons
+        # ══════════════════════════════════════════════════════════════
+        self.intel_crypto = CryptoIntel(self.tracker.db_path)
+        self.intel_scalper = ScalperIntel(self.tracker.db_path)
+        self.intel_weather = WeatherIntel(self.tracker.db_path)
+        self.intel_sports = SportsIntel(self.tracker.db_path)
+
+        # ══════════════════════════════════════════════════════════════
+        # V3 EMPLOYEES — Operations (upgraded)
+        # ══════════════════════════════════════════════════════════════
+        self.compliance = ComplianceOfficer(self.tracker.db_path)
+        self.risk_manager = RiskManager(self.tracker.db_path)
+        self.historian = Historian(self.tracker.db_path)
+
+        print("[MANAGER] V3 employees initialized:")
+        print("  [DB STEWARD] Database infrastructure")
+        print("  [PULSE] Market Pulse Analyst")
+        print("  [DETECTIVE] Forensic investigator")
+        print("  [SIGNALS] Signals Librarian")
+        print("  [LIAISON] Crypto, Scalper, Weather, Sports intelligence")
+        print("  [COMPLIANCE] Adaptive pre-flight validation")
+        print("  [RISK] Adaptive risk assessment")
+        print("  [HISTORIAN] Deep daily analysis")
+
+        # Initialize V3 tables (DB Steward's job)
+        try:
+            self.db_steward.initialize_v3_tables()
+            print("  [DB STEWARD] V3 tables verified")
+        except Exception as e:
+            print(f"  [DB STEWARD] Table init warning: {e}")
+
+        # Register V3 hooks
+        self._register_v3_hooks()
+
+        # ══════════════════════════════════════════════════════════════
+        # WEATHER MODULE
+        # ══════════════════════════════════════════════════════════════
         self.weather_agent = None
         self.sports_analyst = None
         if HAS_WEATHER and getattr(__import__('hedge_fund_config'), 'ENABLE_WEATHER_MODULE', False):
             try:
-                # Will be fully initialized after AI client is set up
                 self._weather_pending = True
             except Exception as e:
                 print(f"[!] Weather module init failed: {e}")
@@ -131,7 +208,9 @@ class ActiveHedgeFundAgent:
         except Exception as e:
             print(f"[BUDDY] Init error: {e}")
 
-        # State
+        # ══════════════════════════════════════════════════════════════
+        # STATE
+        # ══════════════════════════════════════════════════════════════
         self.active_positions = []
         self._positions_locked = False
         self.daily_bet_count = 0
@@ -143,29 +222,29 @@ class ActiveHedgeFundAgent:
         self.last_claim_check = None
         self._last_weather_resolve = None
         self.consecutive_losses = 0
-        self.paused_polymarket = PAUSED_POLYMARKET  # Branch-specific pause
-        self.paused_avantis = PAUSED_AVANTIS        # Branch-specific pause
-        self.avantis_signals = None  # Set properly after resolver init
+        self.paused_polymarket = PAUSED_POLYMARKET
+        self.paused_avantis = PAUSED_AVANTIS
+        self.avantis_signals = None
         self.avantis_executor = None
         self.avantis_daily_bet_count = 0
+
+        # V3 cycle state
+        self._last_pulse_update = None
+        self._last_detective_check = None
+        self._last_monday_check = None
+        self._v3_cycle_count = 0
 
         # Load active positions from DB via wallet coordinator
         crypto_positions = self.wallet.load_positions_from_db()
         self.active_positions = crypto_positions
 
-        # Check position lock
         if len(self.active_positions) >= CRYPTO_MAX_CONCURRENT:
             self._positions_locked = True
 
         # Count today's bets
         try:
-            conn = sqlite3.connect(self.tracker.db_path)
-            c = conn.cursor()
-            c.execute("SELECT COUNT(*) FROM bets WHERE DATE(timestamp) = DATE('now')")
-            self.daily_bet_count = c.fetchone()[0]
-            c.execute("SELECT COUNT(*) FROM bets WHERE DATE(timestamp) = DATE('now') AND category = 'crypto'")
-            self.crypto_daily_bet_count = c.fetchone()[0]
-            conn.close()
+            self.daily_bet_count = self.db_reader.get_daily_bet_count()
+            self.crypto_daily_bet_count = self.db_reader.get_daily_bet_count(category='crypto', cycle_type='crypto')
         except Exception:
             pass
 
@@ -177,7 +256,7 @@ class ActiveHedgeFundAgent:
         deployed = self.wallet.total_deployed()
 
         print("\n" + "="*60)
-        print("CRYPTO HEDGE FUND AGENT")
+        print("BAGGINS CAPITAL V3 — THE MANAGER")
         print("="*60)
         print(f"Mode: {'DRY RUN' if dry_run else 'LIVE'}")
         print(f"[CFO] {self.wallet.status_summary()}")
@@ -193,14 +272,16 @@ class ActiveHedgeFundAgent:
         print(f"Scan Interval: {CRYPTO_SCAN_INTERVAL//60} minutes")
         print(f"Bet Size: ${CRYPTO_BET_MIN}-${CRYPTO_BET_MAX}")
         print(f"Max Concurrent: {CRYPTO_MAX_CONCURRENT}")
+        print(f"V3 Employees: 24 active")
         print("="*60)
 
         self.notifier.notify_alert(
-            f"Crypto hedge fund started\n"
+            f"Baggins Capital V3 Started\n"
             f"Mode: {'DRY RUN' if dry_run else 'LIVE'}\n"
             f"{self.wallet.status_summary()}\n"
             f"Positions: {len(self.active_positions)}\n"
-            f"Today's bets: {self.daily_bet_count}/{CRYPTO_MAX_DAILY_BETS}"
+            f"Today's bets: {self.daily_bet_count}/{CRYPTO_MAX_DAILY_BETS}\n"
+            f"V3: 24 employees active"
         )
 
         # Heartbeat: startup snapshot
@@ -231,13 +312,9 @@ class ActiveHedgeFundAgent:
                 try:
                     self.avantis_signals = AvantisSignals()
                     self.avantis_executor = AvantisExecutor(dry_run=dry_run)
-                    # Count today's avantis bets
                     try:
-                        conn = sqlite3.connect(self.tracker.db_path, timeout=30)
-                        c = conn.cursor()
-                        c.execute("SELECT COUNT(*) FROM avantis_positions WHERE DATE(timestamp) = DATE('now')")
-                        self.avantis_daily_bet_count = c.fetchone()[0]
-                        conn.close()
+                        row = self.db_reader.fetchone("SELECT COUNT(*) FROM avantis_positions WHERE DATE(timestamp) = DATE('now')")
+                        self.avantis_daily_bet_count = row[0] if row else 0
                     except Exception:
                         pass
                     print(f"[LEVERAGE SCOUT] Module initialized - {self.avantis_daily_bet_count} trades today")
@@ -248,7 +325,306 @@ class ActiveHedgeFundAgent:
             else:
                 print("[LEVERAGE SCOUT] Module paused via file or config")
 
-    # Backward compat property
+        # Initial pulse update
+        try:
+            self.pulse.update()
+            self._last_pulse_update = datetime.now()
+            print("[PULSE] Initial pulse update complete")
+        except Exception as e:
+            print(f"[PULSE] Initial update error: {e}")
+
+    # ══════════════════════════════════════════════════════════════
+    # V3 HOOK REGISTRATION
+    # ══════════════════════════════════════════════════════════════
+
+    def _register_v3_hooks(self):
+        """Register all V3 employee hook handlers with Company Clock."""
+        # DAILY_RESET_HOOK (22:00 UTC)
+        self.clock.register_hook('DAILY_RESET_HOOK', self.pulse.on_daily_reset)
+        self.clock.register_hook('DAILY_RESET_HOOK', self.compliance.on_daily_reset)
+
+        # PRE_RESET_HOOK (21:45 UTC — archive before reset)
+        self.clock.register_hook('PRE_RESET_HOOK', self.pulse.on_pre_reset)
+
+        # MONDAY_OPEN_HOOK (weekly adaptive recalculation)
+        self.clock.register_hook('MONDAY_OPEN_HOOK', self._on_monday_open)
+
+        # CIRCUIT_BREAKER_HOOK — notify Messenger on circuit breaker
+        self.clock.register_hook('CIRCUIT_BREAKER_HOOK', self._on_circuit_breaker)
+        self.clock.register_hook('CIRCUIT_BREAKER_CLEAR_HOOK', self._on_circuit_breaker_clear)
+
+        # DAILY_CAP_HIT_HOOK — log when department hits cap
+        self.clock.register_hook('DAILY_CAP_HIT_HOOK', self._on_cap_hit)
+
+        # DAILY_CAP_WARNING_HOOK — CB proximity warning
+        self.clock.register_hook('DAILY_CAP_WARNING_HOOK', self._on_cap_warning)
+
+        print("  [CLOCK] V3 hooks registered: DAILY_RESET, PRE_RESET, MONDAY_OPEN, "
+              "CIRCUIT_BREAKER, CIRCUIT_BREAKER_CLEAR, DAILY_CAP_HIT, DAILY_CAP_WARNING")
+
+    def _on_circuit_breaker(self, payload=None):
+        """Hook handler: circuit breaker triggered."""
+        dept = payload.get('department', 'unknown') if payload else 'unknown'
+        self.notifier.notify_alert(
+            f"CIRCUIT BREAKER TRIGGERED\n\n"
+            f"Department: {dept}\n"
+            f"All new bets halted for {dept}\n"
+            f"Manager must manually clear")
+
+    def _on_circuit_breaker_clear(self, payload=None):
+        """Hook handler: circuit breaker cleared."""
+        dept = payload.get('department', 'unknown') if payload else 'unknown'
+        print(f"  [HOOK] Circuit breaker cleared: {dept} — entering recovery mode")
+        self.notifier.notify_alert(
+            f"CIRCUIT BREAKER CLEARED\n\n"
+            f"Department: {dept}\n"
+            f"Recovery mode: 50% sizing for 2h")
+
+    def _on_cap_hit(self, payload=None):
+        """Hook handler: daily cap reached for a department."""
+        dept = payload.get('department', 'unknown') if payload else 'unknown'
+        print(f"  [HOOK] Daily cap hit: {dept}")
+
+    def _on_cap_warning(self, payload=None):
+        """Hook handler: department approaching circuit breaker or cap exhaustion."""
+        dept = payload.get('department', 'unknown') if payload else 'unknown'
+        warn_type = payload.get('type', '') if payload else ''
+        print(f"  [HOOK] Cap warning: {dept} ({warn_type})")
+
+    def _on_monday_open(self, payload=None):
+        """Monday open: recalculate all adaptive limits from Historian data."""
+        print("\n[MANAGER] MONDAY_OPEN — weekly adaptive recalculation")
+
+        # Gather 7d department win rates from Historian
+        dept_win_rates = {}
+        dept_bet_counts = {}
+        volatility_scores = {}
+        category_avg_adverse = {}
+
+        for dept in ['crypto', 'weather', 'sports', 'updown']:
+            try:
+                stats = self.db_reader.get_department_stats(dept, days=7)
+                if stats:
+                    dept_win_rates[dept] = stats.get('win_rate', 0.50)
+                    dept_bet_counts[dept] = stats.get('total_bets', 0)
+                    # Volatility = std dev of daily P&L
+                    volatility_scores[dept] = stats.get('volatility', 0.15)
+                    category_avg_adverse[dept] = stats.get('avg_loss', 0.10)
+            except Exception as e:
+                print(f"  [MANAGER] Stats error for {dept}: {e}")
+
+        recalc_payload = {
+            'dept_win_rates': dept_win_rates,
+            'dept_bet_counts': dept_bet_counts,
+            'volatility_scores': volatility_scores,
+            'category_avg_adverse': category_avg_adverse,
+        }
+
+        # CFO: recalculate deployment cap, reserve floor, position limits
+        try:
+            blended_wr = self.db_reader.get_blended_win_rate(days=7)
+            self.wallet.on_monday_open({'win_rate_7d': blended_wr})
+        except Exception as e:
+            print(f"  [CFO] Recalc error: {e}")
+
+        # Risk Manager: update thresholds from Historian data
+        try:
+            self.risk_manager.on_monday_open(recalc_payload)
+        except Exception as e:
+            print(f"  [RISK] Recalc error: {e}")
+
+        # Compliance: rescale daily caps by department WR
+        try:
+            self.compliance.on_monday_open(recalc_payload)
+        except Exception as e:
+            print(f"  [COMPLIANCE] Recalc error: {e}")
+
+        print("[MANAGER] Weekly recalculation complete")
+
+    # ══════════════════════════════════════════════════════════════
+    # V3 CYCLE CHECKS (Steps 1-7 of Manager Cycle)
+    # ══════════════════════════════════════════════════════════════
+
+    def _run_v3_pre_trading_checks(self):
+        """V3 Manager cycle steps 1-7. Runs before any trading department."""
+        self._v3_cycle_count += 1
+        ctx = get_context()
+
+        # Step 1: Query CFO
+        try:
+            cfo_state = self.wallet.get_state()
+            if self._v3_cycle_count % 10 == 1:  # Log every 10th cycle
+                print(f"  [CFO] Available: ${cfo_state.get('available_capital', 0):.2f} | "
+                      f"Deploy: {cfo_state.get('deployment_cap_pct', 0.70):.0%} | "
+                      f"Positions: {cfo_state.get('open_positions', 0)}/{cfo_state.get('position_limit', 25)}")
+        except Exception as e:
+            print(f"  [CFO] CRITICAL — cannot query state: {e}")
+            print(f"  [MANAGER] HALTING all trading until CFO restored")
+            return False
+
+        # Step 2: Query Risk Manager for circuit breakers
+        try:
+            risk_summary = self.risk_manager.get_risk_summary()
+            active_cbs = risk_summary.get('circuit_breakers_active', [])
+            if active_cbs:
+                for dept in active_cbs:
+                    print(f"  [RISK] Circuit breaker ACTIVE: {dept} — department halted")
+                    # Fire condition hook
+                    self.clock.fire_hook('CIRCUIT_BREAKER_HOOK', {
+                        'department': dept, 'action': 'active'})
+        except Exception as e:
+            print(f"  [RISK] Warning — assessment unavailable: {e}")
+
+        # Step 3: Check Compliance blocklist for new entries since last cycle
+        try:
+            blocklist_summary = self.compliance.get_daily_summary()
+            rejected = blocklist_summary.get('rejected', 0)
+            if rejected > 0 and self._v3_cycle_count % 10 == 1:
+                print(f"  [COMPLIANCE] {rejected} rejections today | "
+                      f"Adaptive caps: {blocklist_summary.get('adaptive_caps', {})}")
+        except Exception as e:
+            print(f"  [COMPLIANCE] Blocklist check error: {e}")
+
+        # Step 4: Update Market Pulse + surface alerts
+        try:
+            pulse_needed = (self._last_pulse_update is None or
+                           (datetime.now() - self._last_pulse_update).total_seconds() > 1800)
+            if pulse_needed:
+                self.pulse.update()
+                self._last_pulse_update = datetime.now()
+
+            # Surface pulse alerts to Manager
+            for dept in ['crypto', 'weather', 'sports', 'updown']:
+                snapshot = self.pulse.get_department_snapshot(dept)
+                if not snapshot:
+                    continue
+                # CB proximity alert (4+ consecutive losses)
+                cb_prox = snapshot.get('circuit_breaker_proximity', {})
+                if cb_prox.get('details', {}).get('warning'):
+                    consec = cb_prox['details'].get('consecutive_losses', 0)
+                    print(f"  [PULSE] WARNING: {dept} at {consec} consecutive losses — CB proximity")
+                    if consec >= 4:
+                        self.clock.fire_hook('DAILY_CAP_WARNING_HOOK', {
+                            'department': dept, 'type': 'cb_proximity',
+                            'consecutive_losses': consec})
+                # Cap exhaustion (80%+ used)
+                cap_prog = snapshot.get('daily_cap_progress', {})
+                if cap_prog.get('value', 0) >= 0.80:
+                    remaining = cap_prog.get('details', {}).get('remaining', 0)
+                    print(f"  [PULSE] {dept} cap at {cap_prog['value']:.0%} — {remaining} bets remaining")
+                    if cap_prog['value'] >= 1.0:
+                        self.clock.fire_hook('DAILY_CAP_HIT_HOOK', {
+                            'department': dept})
+        except Exception as e:
+            print(f"  [PULSE] Update error: {e}")
+
+        # Step 5: Check time-based hooks (Company Clock)
+        try:
+            self.clock.check_and_fire_hooks()
+        except Exception as e:
+            print(f"  [CLOCK] Hook check error: {e}")
+
+        # Check Monday open (weekly recalibration)
+        try:
+            now = datetime.now()
+            if now.weekday() == 0 and now.hour >= 9:  # Monday after 9 AM
+                if (self._last_monday_check is None or
+                    (now - self._last_monday_check).days >= 1):
+                    self._on_monday_open()
+                    self._last_monday_check = now
+        except Exception:
+            pass
+
+        return True
+
+    def _get_liaison_package(self, department):
+        """Step 7: Get intelligence package from department's Liaison."""
+        try:
+            if department == 'crypto':
+                return self.intel_crypto.get_package()
+            elif department == 'updown':
+                return self.intel_scalper.get_package()
+            elif department == 'weather':
+                return self.intel_weather.get_package()
+            elif department == 'sports':
+                return self.intel_sports.get_package()
+        except Exception as e:
+            print(f"  [LIAISON] {department} package error: {e}")
+        return None
+
+    def _is_department_eligible(self, department):
+        """Step 5-6: Check if department can trade this cycle."""
+        # Circuit breaker check
+        try:
+            risk_summary = self.risk_manager.get_risk_summary()
+            if department in risk_summary.get('circuit_breakers_active', []):
+                return False, "circuit breaker active"
+        except Exception:
+            pass
+
+        # Time window check for weather
+        if department == 'weather':
+            ctx = get_context()
+            hour_et = ctx.hour
+            in_window = (8 <= hour_et < 10) or (14 <= hour_et < 16) or (21 <= hour_et < 23)
+            if not in_window:
+                return False, "outside weather trading window"
+
+        return True, "eligible"
+
+    # ══════════════════════════════════════════════════════════════
+    # V3 DETECTIVE REVIEW (Step 9)
+    # ══════════════════════════════════════════════════════════════
+
+    def _review_detective_findings(self):
+        """Step 9: Check if Detective should investigate, review pending findings."""
+        try:
+            ran_investigation = False
+            if self.detective.should_investigate():
+                print("\n[DETECTIVE] Starting forensic investigation...")
+                result = self.detective.investigate()
+                if result.get('ran'):
+                    ran_investigation = True
+                    count = result.get('findings', 0)
+                    print(f"  [DETECTIVE] Investigation complete: {count} new findings")
+                else:
+                    print("  [DETECTIVE] No actionable findings this session")
+
+            # Catalog any pending findings from detective_findings table into Signals Library
+            pending = self.db_reader.fetchall(
+                "SELECT id, root_cause, confidence, recommended_action, affected_employee "
+                "FROM detective_findings WHERE status = 'pending'"
+            )
+            if pending:
+                cataloged = 0
+                for row in pending:
+                    finding_id, root_cause, confidence, recommendation, category = row
+                    result = self.signals.catalog_finding(
+                        finding_id=finding_id,
+                        category=category or 'unknown',
+                        root_cause=root_cause or '',
+                        recommendation=recommendation or '',
+                        confidence=confidence or 0.5,
+                    )
+                    if result and result.get('cataloged'):
+                        cataloged += 1
+                if cataloged > 0:
+                    print(f"  [DETECTIVE] {cataloged}/{len(pending)} pending findings cataloged to Signals Library")
+                if ran_investigation and cataloged > 0:
+                    self.notifier.notify_alert(
+                        f"DETECTIVE FINDINGS\n\n"
+                        f"{cataloged} new findings cataloged to Signals Library\n"
+                        f"Check detective_findings table"
+                    )
+            elif ran_investigation:
+                print("  [DETECTIVE] No pending findings to catalog")
+        except Exception as e:
+            print(f"  [DETECTIVE] Investigation error: {e}")
+
+    # ══════════════════════════════════════════════════════════════
+    # BACKWARD COMPAT PROPERTIES
+    # ══════════════════════════════════════════════════════════════
+
     @property
     def balance(self):
         return self.wallet.available
@@ -272,48 +648,40 @@ class ActiveHedgeFundAgent:
         Checks both market_id AND market_title to prevent duplicates.
         """
         market_id_str = str(market_id)
-        # Check in-memory active positions first (fast path)
         for pos in self.active_positions:
             if str(pos.get('market_id')) == market_id_str:
                 return True
             if market_title and pos.get('market_title', '').lower() == market_title.lower():
                 return True
-        # Check DB for any bet on same market (unresolved OR resolved within 72h)
         try:
-            conn = sqlite3.connect(self.tracker.db_path, timeout=30)
-            c = conn.cursor()
-            # Check 1: Any unresolved bet on same market_id
-            c.execute("""SELECT COUNT(*) FROM bets
-                         WHERE market_id = ? AND status != 'resolved'""", (market_id_str,))
-            if c.fetchone()[0] > 0:
-                conn.close()
+            row = self.db_reader.fetchone(
+                "SELECT COUNT(*) FROM bets WHERE market_id = ? AND status != 'resolved'",
+                (market_id_str,))
+            if row[0] > 0:
                 return True
-            # Check 2: Any bet (resolved or not) on same market_id in last 72h
-            c.execute("""SELECT COUNT(*) FROM bets
-                         WHERE market_id = ? AND timestamp > datetime('now', '-72 hours')""", (market_id_str,))
-            if c.fetchone()[0] > 0:
-                conn.close()
+            row = self.db_reader.fetchone(
+                "SELECT COUNT(*) FROM bets WHERE market_id = ? AND timestamp > datetime('now', '-72 hours')",
+                (market_id_str,))
+            if row[0] > 0:
                 return True
-            # Check 3: Title-based fallback (catches cases where market_id differs)
             if market_title:
-                c.execute("""SELECT COUNT(*) FROM bets
-                             WHERE market_title = ? AND timestamp > datetime('now', '-72 hours')""",
-                          (market_title,))
-                if c.fetchone()[0] > 0:
-                    conn.close()
+                row = self.db_reader.fetchone(
+                    "SELECT COUNT(*) FROM bets WHERE market_title = ? AND timestamp > datetime('now', '-72 hours')",
+                    (market_title,))
+                if row[0] > 0:
                     print(f"  [CRYPTO TRADER] Title match caught duplicate: {market_title[:50]}")
                     return True
-            conn.close()
         except Exception as e:
             print(f"  [CRYPTO TRADER] DB check error (defaulting to SKIP): {e}")
-            return True  # SAFE DEFAULT: assume duplicate on error
+            return True
         return False
+
     # ------------------------------------------------------------------
     # Crypto betting
     # ------------------------------------------------------------------
 
-    def run_crypto_cycle(self):
-        """Run crypto cycle -- markets resolving within 72 hours."""
+    def run_crypto_cycle(self, scout_queue=None):
+        """Run crypto cycle — markets resolving within 72 hours."""
         time_since = (datetime.now() - self.last_crypto_scan).total_seconds()
         if time_since < CRYPTO_SCAN_INTERVAL:
             return
@@ -333,6 +701,12 @@ class ActiveHedgeFundAgent:
         if len(crypto_positions) >= CRYPTO_MAX_CONCURRENT:
             return
 
+        # V3 Step 5-6: Check department eligibility
+        eligible, reason = self._is_department_eligible('crypto')
+        if not eligible:
+            print(f"  [MANAGER] Crypto department ineligible: {reason}")
+            return
+
         print(f"\n{'='*60}")
         print(f"CRYPTO CYCLE - {datetime.now().strftime('%H:%M:%S')}")
         print(f"{'='*60}")
@@ -343,18 +717,33 @@ class ActiveHedgeFundAgent:
         daily_roi = (self.balance - self.starting_daily_balance) / self.starting_daily_balance if self.starting_daily_balance > 0 else 0.0
         print(f"Daily ROI: {daily_roi:+.1%}")
 
-        markets = self.crypto_scanner.scan_crypto_markets()
-        if not markets:
-            print("[!] No crypto markets found")
-            return
+        # V3 Step 7: Get Liaison intelligence package
+        intel_package = self._get_liaison_package('crypto')
+        if intel_package:
+            # Check for modifier drift flags
+            drift_flag = intel_package.get('use_flat_modifiers', False)
+            if drift_flag:
+                print("  [LIAISON] Modifier drift detected — using flat modifiers this cycle")
+            # Log package summary
+            pulse = intel_package.get('pulse', {})
+            wr = pulse.get('rolling_win_rate', {}).get('value')
+            if wr is not None:
+                print(f"  [LIAISON] Crypto WR: {wr:.1%} | Streak: {pulse.get('current_streak', {}).get('value', 0)}")
 
-        # Filter: must resolve within 72 hours
-        crypto_markets = [m for m in markets if 0 < m.get("days_until", 99) <= CRYPTO_MAX_HOURS / 24.0]
-        if not crypto_markets:
-            print(f"  No markets resolving within {CRYPTO_MAX_HOURS}h")
-            return
-
-        print(f"[CRYPTO TRADER] {len(crypto_markets)} markets within {CRYPTO_MAX_HOURS}h window")
+        # Use Scout queue if available, otherwise fall back to direct scan
+        if scout_queue:
+            crypto_markets = scout_queue
+            print(f"[CRYPTO TRADER] {len(crypto_markets)} markets from Scout queue")
+        else:
+            markets = self.crypto_scanner.scan_crypto_markets()
+            if not markets:
+                print("[!] No crypto markets found")
+                return
+            crypto_markets = [m for m in markets if 0 < m.get("days_until", 99) <= CRYPTO_MAX_HOURS / 24.0]
+            if not crypto_markets:
+                print(f"  No markets resolving within {CRYPTO_MAX_HOURS}h")
+                return
+            print(f"[CRYPTO TRADER] {len(crypto_markets)} markets within {CRYPTO_MAX_HOURS}h window")
 
         recommendations = self.crypto_scanner.evaluate_markets(crypto_markets)
         print(f"\n[CRYPTO TRADER] {len(recommendations)} recommendations")
@@ -373,31 +762,93 @@ class ActiveHedgeFundAgent:
                 print("[!] Balance too low for more bets")
                 break
 
-            if self._should_skip_bet(rec, existing_positions, bets_executed):
+            if self._should_skip_bet(rec, existing_positions, bets_executed, intel_package):
                 continue
-            if self._execute_crypto_bet(rec):
+            if self._execute_crypto_bet(rec, intel_package):
                 bets_executed += 1
 
         print(f"\n[CRYPTO TRADER] Executed {bets_executed} bets")
 
-    def _should_skip_bet(self, rec, existing_positions, bets_executed):
-        """Check if a bet should be skipped."""
+    def _should_skip_bet(self, rec, existing_positions, bets_executed, intel_package=None):
+        """V3 6-Step Bet Protocol: Liaison → Risk → CFO → Dept Intel → Compliance → Banker.
+
+        Returns True if bet should be skipped (rejected at any gate).
+        """
         if self.paused_polymarket:
             print(f"  [PAUSED] Polymarket crypto branch paused - stopping execution")
             return True
-        if self._is_already_bet(rec['market_id'], rec.get('market_title')):
-            print(f"  [SKIP] Already have position on {rec['market_title'][:50]}")
+
+        # In-memory position check (fast path)
+        for pos in existing_positions:
+            if str(pos.get('market_id')) == str(rec['market_id']):
+                print(f"  [SKIP] Already have position on {rec['market_title'][:50]}")
+                return True
+
+        bet_dict = {
+            'market_id': rec['market_id'],
+            'market_title': rec.get('market_title', ''),
+            'category': 'crypto',
+            'side': rec.get('bet_side', ''),
+            'amount': rec.get('bet_amount', 3.0),
+            'odds': rec.get('bet_odds', 0),
+            'edge': rec.get('edge', 0),
+            'confidence': rec.get('confidence', 0),
+        }
+
+        # ── STEP 1: Intelligence Liaison (already fetched, applied via intel_package) ──
+        # Liaison package was retrieved in run_crypto_cycle and passed here
+
+        # ── STEP 2: Risk Manager (advisory — only blocks on circuit breaker) ──
+        risk_ok, risk_level, risk_warnings = self.risk_manager.assess(bet_dict)
+        if not risk_ok:
+            print(f"  [RISK] Blocked: {risk_warnings[0] if risk_warnings else 'circuit breaker'}")
             return True
 
-        # Use wallet coordinator for risk check
-        can, reason = self.wallet.can_bet('crypto', rec['bet_amount'])
+        # Apply risk advisory: raise confidence floor on HIGH warnings
+        if risk_level == 'high':
+            original_conf = bet_dict['confidence']
+            # HIGH warnings: need 10% higher confidence
+            min_conf = original_conf * 1.10
+            if rec.get('confidence', 0) < min_conf:
+                print(f"  [RISK] HIGH warning — confidence {rec['confidence']} below raised floor {min_conf:.0f}")
+                # Advisory only — don't skip, just log the warning
+
+        # Check recovery mode sizing
+        recovery_mult = self.risk_manager.get_recovery_sizing_multiplier('crypto')
+        if recovery_mult < 1.0:
+            bet_dict['amount'] = round(bet_dict['amount'] * recovery_mult, 2)
+            print(f"  [RISK] Recovery mode — bet sized at {recovery_mult:.0%}: ${bet_dict['amount']:.2f}")
+
+        # ── STEP 3: CFO verification ──
+        can, reason = self.wallet.can_bet('crypto', bet_dict['amount'])
         if not can:
             print(f"  [CFO] {reason}")
             return True
+
+        # ── STEP 4: Department Intelligence (from Liaison package) ──
+        if intel_package:
+            # Apply modifier drift flag
+            if intel_package.get('use_flat_modifiers', False):
+                # Flag is advisory — trader should use flat modifiers
+                pass  # Trader's evaluate_markets already ran, but we log the warning
+
+        # ── STEP 5: Compliance pre-flight (HARD GATE) ──
+        approved, reason, warnings = self.compliance.pre_flight(bet_dict)
+        if not approved:
+            print(f"  [COMPLIANCE] Rejected: {reason}")
+            return True
+
+        # All gates passed — proceed to Step 6 (Banker execution) in _execute_crypto_bet
         return False
-    def _execute_crypto_bet(self, rec: dict) -> bool:
-        """Execute a single crypto bet — flat $3 sizing."""
+
+    def _execute_crypto_bet(self, rec: dict, intel_package=None) -> bool:
+        """Execute a single crypto bet — V3 Step 6: Banker + Write Archivist."""
         bet_amount = 3.0
+
+        # Apply recovery mode sizing if active
+        recovery_mult = self.risk_manager.get_recovery_sizing_multiplier('crypto')
+        if recovery_mult < 1.0:
+            bet_amount = round(bet_amount * recovery_mult, 2)
 
         can, reason = self.wallet.can_bet('crypto', bet_amount)
         if not can:
@@ -410,8 +861,10 @@ class ActiveHedgeFundAgent:
         print(f"  Amount: ${bet_amount:.2f}")
         print(f"  Odds: {rec['bet_odds']:.1%}")
         print(f"  Edge: {rec['edge']:+.1%}")
+        print(f"  Type: {rec.get('bet_type', 'UNKNOWN')}")
         print(f"  Confidence: {rec['confidence']}")
 
+        # Step 6a: Execute via Banker
         bankr_result = self.bankr.place_bet(
             market_title=rec['market_title'],
             side=rec['bet_side'],
@@ -425,30 +878,71 @@ class ActiveHedgeFundAgent:
 
         print(f"  [BANKER] Trade ID: {bankr_result['trade_id']}")
 
+        # Verify bet execution
+        try:
+            verify_result = self.bankr.verify_bet_execution(rec['market_title'], rec['bet_side'])
+            if verify_result.get("verified"):
+                print(f"  [VERIFIED] Crypto bet confirmed in Bankr positions")
+            else:
+                print(f"  [WARN] Crypto bet unverified: {verify_result.get('reason', 'unknown')} -- logging anyway")
+        except Exception as ve:
+            print(f"  [WARN] Crypto verification failed: {ve} -- logging anyway")
+
         balance_before = self.balance
 
-        bet_id = self.tracker.log_bet(
+        # Step 6b: Log full decision snapshot via Write Archivist
+        decision_snapshot = {
+            'raw_data': {
+                'market_odds': rec.get('bet_odds'),
+                'our_estimate': rec.get('our_estimate'),
+                'coin_id': rec.get('coin_id'),
+                'current_price': rec.get('current_price'),
+                'change_24h': rec.get('change_24h'),
+                'change_7d': rec.get('change_7d'),
+                'target_price': rec.get('target_price'),
+            },
+            'modifiers': {
+                'hour_mod': rec.get('hour_mod'),
+                'asset_mod': rec.get('asset_mod'),
+            },
+            'decision': {
+                'confidence': rec.get('confidence'),
+                'edge': rec.get('edge'),
+                'format_type': rec.get('format_type', 'unknown'),
+                'direction': rec.get('direction'),
+                'same_day': rec.get('same_day'),
+                'days_until': rec.get('days_until'),
+            },
+            'strategy': {
+                'bet_type': rec.get('bet_type', 'UNKNOWN'),
+                'term': rec.get('_term', 'crypto'),
+                'composite_score': rec.get('composite_score'),
+            },
+            'v3_context': {
+                'liaison_package': bool(intel_package),
+                'risk_level': 'assessed',
+                'recovery_mode': recovery_mult < 1.0,
+                'cfo_state': 'verified',
+                'compliance': 'passed',
+            },
+        }
+
+        bet_id = self.data_intake.validate_and_write_bet(
             market_id=rec['market_id'],
             market_title=rec['market_title'],
             category='crypto',
             side=rec['bet_side'],
             amount=bet_amount,
             odds=rec['bet_odds'],
-            score=rec['confidence'],
+            confidence_score=rec['confidence'],
             edge=rec['edge'],
             reasoning=rec['reasoning'],
-            balance_before=balance_before
+            balance_before=balance_before,
+            cycle_type='crypto',
+            bet_type=rec.get('bet_type', 'UNKNOWN'),
+            format_type=rec.get('format_type', 'unknown'),
+            decision_snapshot=decision_snapshot,
         )
-
-        # Update cycle_type in DB
-        try:
-            conn = sqlite3.connect(self.tracker.db_path)
-            c = conn.cursor()
-            c.execute("UPDATE bets SET cycle_type = ? WHERE id = ?", ('crypto', bet_id))
-            conn.commit()
-            conn.close()
-        except Exception:
-            pass
 
         term = rec.get('_term', 'crypto')
 
@@ -460,6 +954,7 @@ class ActiveHedgeFundAgent:
             'side': rec['bet_side'],
             'odds': rec['bet_odds'],
             'category': 'crypto',
+            'bet_type': rec.get('bet_type', 'UNKNOWN'),
             'term': term,
             'cycle_type': 'crypto',
             'days_until': rec.get('days_until'),
@@ -516,7 +1011,7 @@ class ActiveHedgeFundAgent:
             self.consecutive_losses += 1
 
         self.active_positions = [p for p in self.active_positions if p['bet_id'] != bet_id]
-        self.tracker.resolve_bet(bet_id, won, profit, self.balance)
+        self.data_intake.validate_and_write_resolution(bet_id, won, profit, self.balance)
 
         daily_roi = (self.balance - self.starting_daily_balance) / self.starting_daily_balance if self.starting_daily_balance > 0 else 0.0
         print(f"  [RESOLVED] {'WON' if won else 'LOST'} - Profit: ${profit:+.2f}")
@@ -559,7 +1054,6 @@ class ActiveHedgeFundAgent:
         if self.paused_avantis:
             return
 
-        # Check pause file
         pause_file = os.path.join(os.path.dirname(os.path.abspath(__file__)), '.pause_avantis')
         if os.path.exists(pause_file):
             return
@@ -577,7 +1071,6 @@ class ActiveHedgeFundAgent:
         if self.avantis_daily_bet_count >= max_daily:
             return
 
-        # Check open positions
         open_positions = self.tracker.get_open_avantis_positions()
         if len(open_positions) >= max_concurrent:
             return
@@ -613,7 +1106,6 @@ class ActiveHedgeFundAgent:
 
         trades_executed = 0
         for signal in good_signals[:max_trades]:
-            # Skip if already have open position on same pair+side
             already_open = any(
                 p['pair'] == signal['pair'] and p['side'] == signal['side']
                 for p in open_positions
@@ -672,7 +1164,6 @@ class ActiveHedgeFundAgent:
 
         trade_id = result.get('trade_id', result.get('response', '')[:50])
 
-        # Log to DB
         try:
             pos_id = self.tracker.log_avantis_position(
                 pair=pair,
@@ -691,7 +1182,6 @@ class ActiveHedgeFundAgent:
             print(f"  [WARNING] DB log failed: {e}")
             pos_id = None
 
-        # Reserve funds in wallet coordinator
         position_data = {
             'avantis_id': pos_id,
             'pair': pair,
@@ -732,19 +1222,16 @@ class ActiveHedgeFundAgent:
             print(f"[LEVERAGE SCOUT] Position check error: {e}")
             return
 
-        # Check for ambiguous response (couldn't parse)
         if bankr_positions and any(p.get('ambiguous') for p in bankr_positions):
             print("  [LEVERAGE SCOUT] Position response ambiguous — skipping auto-close")
             return
 
         if not bankr_positions:
-            # Bankr confirms no open positions — check trade history for real P&L
             for pos in open_positions:
                 try:
                     opened_at = datetime.fromisoformat(pos['timestamp'])
                     if (datetime.now() - opened_at).total_seconds() > 300:
                         print(f"  [LEVERAGE SCOUT] Position #{pos['id']} ({pos['pair']}) appears closed")
-                        # Query Bankr for actual trade history / P&L
                         pnl = None
                         collateral = pos.get('collateral', 0)
                         exit_reason = 'position_not_found'
@@ -758,7 +1245,6 @@ class ActiveHedgeFundAgent:
                             print(f"  [LEVERAGE SCOUT] Trade history query failed: {he}")
 
                         if pnl is not None:
-                            # Got real P&L
                             released = max(0, collateral + pnl)
                             self.tracker.close_avantis_position(
                                 position_id=pos['id'],
@@ -775,7 +1261,6 @@ class ActiveHedgeFundAgent:
                                 f"Exit: {exit_reason}"
                             )
                         else:
-                            # Can't determine P&L — mark needs_review, don't auto-close
                             print(f"  [LEVERAGE SCOUT] WARNING: Unknown P&L for #{pos['id']} — marking needs_review")
                             self.tracker.close_avantis_position(
                                 position_id=pos['id'],
@@ -784,7 +1269,6 @@ class ActiveHedgeFundAgent:
                                 pnl_pct=0,
                                 exit_reason='needs_review'
                             )
-                            # Still release collateral (assume worst case: lost)
                             self.wallet.release_funds('avantis', pos['id'], 0)
                             self.notifier.notify_alert(
                                 f"AVANTIS NEEDS REVIEW\n\n"
@@ -796,7 +1280,6 @@ class ActiveHedgeFundAgent:
                     print(f"  [LEVERAGE SCOUT] Error closing #{pos['id']}: {e}")
             return
 
-        # Check each DB position against Bankr's open positions
         bankr_pairs = set()
         for bp in bankr_positions:
             pair_key = bp.get('pair', '') or bp.get('market', '')
@@ -804,7 +1287,6 @@ class ActiveHedgeFundAgent:
 
         for pos in open_positions:
             pair_upper = pos['pair'].upper().replace('/', '')
-            # Check if this position is still in Bankr's list
             still_open = False
             for bp_pair in bankr_pairs:
                 if pair_upper in bp_pair.upper().replace('/', '') or bp_pair.upper().replace('/', '') in pair_upper:
@@ -815,8 +1297,6 @@ class ActiveHedgeFundAgent:
                 try:
                     opened_at = datetime.fromisoformat(pos['timestamp'])
                     if (datetime.now() - opened_at).total_seconds() > 300:
-                        # Position closed (SL/TP or liquidation)
-                        # Try to determine P&L from collateral
                         collateral = pos['collateral']
                         print(f"  [LEVERAGE SCOUT] Position #{pos['id']} ({pos['pair']}) CLOSED by exchange")
                         self.tracker.close_avantis_position(
@@ -949,7 +1429,7 @@ Respond in JSON format:
 
         try:
             response = self._ai_client.messages.create(
-                model="claude-haiku-4-5-20251001",
+                model="deepseek-v3.2",
                 max_tokens=2500,
                 messages=[{"role": "user", "content": prompt}]
             )
@@ -972,7 +1452,7 @@ Respond in JSON format:
                 try:
                     fallback_client = anthropic.Anthropic(api_key=self._ai_fallback_key)
                     response = fallback_client.messages.create(
-                        model="claude-haiku-4-5-20251001",
+                        model="deepseek-v3.2",
                         max_tokens=2500,
                         messages=[{"role": "user", "content": prompt}]
                     )
@@ -1034,7 +1514,7 @@ Respond in JSON format:
                     self.wallet.release_funds('crypto', bet_id, 0)
                     self.consecutive_losses += 1
 
-                self.tracker.resolve_bet(pos['bet_id'], won, profit, self.balance)
+                self.data_intake.validate_and_write_resolution(pos['bet_id'], won, profit, self.balance)
                 self.active_positions = [p for p in self.active_positions if p['bet_id'] != bet_id]
 
                 if SMS_ON_BET_RESOLVE:
@@ -1066,8 +1546,6 @@ Respond in JSON format:
         if len(self.active_positions) < CRYPTO_MAX_CONCURRENT:
             self.wallet.sync_with_wallet(update_starting=False)
 
-    # claim_resolved_positions() removed -- replaced by BetResolver
-
     # ------------------------------------------------------------------
     # Summaries & resets
     # ------------------------------------------------------------------
@@ -1083,16 +1561,12 @@ Respond in JSON format:
         daily_roi = (self.balance - self.starting_daily_balance) / self.starting_daily_balance if self.starting_daily_balance > 0 else 0.0
         daily_profit = self.balance - self.starting_daily_balance
 
-        conn = sqlite3.connect(self.tracker.db_path)
-        c = conn.cursor()
-        c.execute("""
+        result = self.db_reader.fetchone("""
             SELECT COUNT(*) as total, SUM(won) as wins
             FROM bets
             WHERE DATE(timestamp) = DATE('now')
             AND status = 'resolved'
         """)
-        result = c.fetchone()
-        conn.close()
 
         total_resolved = result[0] if result[0] else 0
         wins = result[1] if result[1] else 0
@@ -1141,29 +1615,74 @@ Avantis: {len(self.tracker.get_open_avantis_positions()) if self.avantis_signals
         )
 
     def check_daily_reset(self):
-        """Reset daily counters at 10 PM for next day's markets."""
+        """V3 Daily Reset at 22:00 UTC — fires hooks, runs Historian, resets counters."""
         now = datetime.now()
 
         if now.hour == DAILY_RESET_HOUR and (now - self.last_improvement_time).total_seconds() > 3600:
             print(f"\n{'='*60}")
-            print(f"DAILY RESET - 10 PM")
+            print(f"V3 DAILY RESET - 22:00 UTC")
             print(f"{'='*60}")
 
+            # Step 10a: Fire PRE_RESET hook (archive pulse data)
+            try:
+                self.clock.fire_hook('PRE_RESET_HOOK')
+                print("  [CLOCK] PRE_RESET hook fired")
+            except Exception as e:
+                print(f"  [CLOCK] PRE_RESET error: {e}")
+
+            # Step 10b: Run Historian daily analysis
+            try:
+                self.historian.run_daily_analysis()
+                print("  [HISTORIAN] Daily analysis complete")
+            except Exception as e:
+                print(f"  [HISTORIAN] Daily analysis error: {e}")
+
+            # Step 10c: Fire DAILY_RESET hook (pulse reset, compliance cleanup)
+            try:
+                self.clock.fire_hook('DAILY_RESET_HOOK')
+                print("  [CLOCK] DAILY_RESET hook fired")
+            except Exception as e:
+                print(f"  [CLOCK] DAILY_RESET error: {e}")
+
+            # Log daily improvement metrics
             improvements = self.tracker.run_daily_improvement()
             today_roi = self.tracker.get_daily_roi()
 
             if today_roi['total_bets'] > 0:
-                print(f"\n[MANAGER]")
+                print(f"\n[MANAGER] Daily Performance:")
                 print(f"  Profit: ${today_roi['profit']:+.2f}")
                 print(f"  ROI: {today_roi['roi']:+.1%}")
                 print(f"  Target Met: {'YES' if today_roi['met_target'] else 'NO'}")
 
+            # V3 compliance + risk summary
+            try:
+                compliance_summary = self.compliance.get_daily_summary()
+                risk_summary = self.risk_manager.get_risk_summary()
+                print(f"  [COMPLIANCE] Today: {compliance_summary.get('approved', 0)} approved, "
+                      f"{compliance_summary.get('rejected', 0)} rejected")
+                print(f"  [COMPLIANCE] Adaptive caps: {compliance_summary.get('adaptive_caps', {})}")
+                print(f"  [RISK] Circuit breakers: {risk_summary.get('circuit_breakers_active', [])}")
+                print(f"  [RISK] Recovery mode: {risk_summary.get('recovery_mode', [])}")
+            except Exception as e:
+                print(f"  [MANAGER] Summary error: {e}")
+
+            # Signals Library summary
+            try:
+                signals_summary = self.signals.get_summary()
+                if signals_summary.get('total_signals', 0) > 0:
+                    print(f"  [SIGNALS] Library: {signals_summary['total_signals']} total, "
+                          f"{signals_summary.get('positive_outcomes', 0)} positive outcomes")
+            except Exception:
+                pass
+
+            # Notification
             self.notifier.notify_alert(
-                f"DAILY RESET 10PM\n\n"
+                f"V3 DAILY RESET 22:00 UTC\n\n"
                 f"Crypto bets today: {self.crypto_daily_bet_count}/{CRYPTO_MAX_DAILY_BETS}\n"
                 f"{self.wallet.status_summary()}\n"
                 f"Active: {self.wallet.total_position_count()} positions\n"
-                f"Counter reset - ready for tomorrow"
+                f"Historian: daily analysis complete\n"
+                f"Counter reset — ready for tomorrow"
             )
 
             deployed = self.wallet.total_deployed()
@@ -1173,6 +1692,7 @@ Avantis: {len(self.tracker.get_open_avantis_positions()) if self.avantis_signals
                 ending_balance=total_value
             )
 
+            # Reset counters
             self.last_improvement_time = now
             self.daily_bet_count = 0
             self.crypto_daily_bet_count = 0
@@ -1186,15 +1706,15 @@ Avantis: {len(self.tracker.get_open_avantis_positions()) if self.avantis_signals
             if self.dry_run:
                 self.wallet.starting_daily = self.balance
 
-            print(f"\n[MANAGER] Bet counter reset to 0/{CRYPTO_MAX_DAILY_BETS}")
-            print(f"Starting Balance: ${self.balance:.2f}")
+            print(f"\n[MANAGER] Counters reset. Starting balance: ${self.balance:.2f}")
+        print(f"Company Clock: {clock_status()}")
 
     def periodic_balance_check(self):
         """Re-sync wallet balance periodically."""
         self.wallet.periodic_sync()
 
     # ------------------------------------------------------------------
-    # Main loop
+    # Main loop — V3 Workflow
     # ------------------------------------------------------------------
 
     def _run_pattern_analysis(self):
@@ -1288,7 +1808,7 @@ Respond in JSON:
 }}"""
 
             response = self._ai_client.messages.create(
-                model="claude-haiku-4-5-20251001",
+                model="deepseek-v3.2",
                 max_tokens=2500,
                 messages=[{"role": "user", "content": prompt}]
             )
@@ -1339,7 +1859,6 @@ Respond in JSON:
         except Exception as e:
             print(f"  [MANAGER] Error: {e}")
 
-
     def _write_shared_status(self):
         """Write shared status file for Baggins monitoring."""
         try:
@@ -1376,8 +1895,17 @@ Respond in JSON:
                     'collateral': ap.get('collateral', 0),
                 })
 
+            # V3: include risk + compliance state
+            try:
+                risk_summary = self.risk_manager.get_risk_summary()
+                compliance_summary = self.compliance.get_daily_summary()
+            except Exception:
+                risk_summary = {}
+                compliance_summary = {}
+
             status = {
                 'timestamp': datetime.now().isoformat(),
+                'version': 'v3',
                 'balance': round(self.balance, 2),
                 'deployed': round(deployed, 2),
                 'total_value': round(self.balance + deployed, 2),
@@ -1393,21 +1921,36 @@ Respond in JSON:
                 'avantis_positions': avantis_positions,
                 'avantis_paused': self.paused_avantis,
                 'avantis_daily_trades': self.avantis_daily_bet_count,
+                'v3_cycle_count': self._v3_cycle_count,
+                'circuit_breakers': risk_summary.get('circuit_breakers_active', []),
+                'adaptive_caps': compliance_summary.get('adaptive_caps', {}),
             }
 
-            os.makedirs('/home/ubuntu/shared', exist_ok=True)
-            with open('/home/ubuntu/shared/hedge_fund_status.json', 'w') as f:
+            shared_dir = os.getenv('SHARED_DIR', os.path.expanduser('~/shared'))
+            os.makedirs(shared_dir, exist_ok=True)
+            with open(os.path.join(shared_dir, 'hedge_fund_status.json'), 'w') as f:
                 json.dump(status, f, indent=2)
 
         except Exception as e:
             pass  # Never crash the agent for status writes
 
-    # _check_weather_resolutions() removed -- replaced by BetResolver
-
     def run(self):
-        """Main run loop."""
+        """V3 Main Run Loop — 10-step Manager cycle.
+
+        Firing order per V3 Playbook:
+        1. V3 pre-trading checks (CFO, Risk, Pulse, Hooks, Liaisons)
+        2. Weather cycle (seniority on funds)
+        3. Scalper cycle (Up/Down 15-min)
+        4. Crypto cycle (6-step bet protocol)
+        5. Avantis cycle (leverage trading)
+        6. Sports cycle
+        7. Settlement Clerk (resolver)
+        8. Position checks + heartbeat
+        9. Detective review (30h interval)
+        10. Summaries, daily reset, shared status
+        """
         print(f"\n{'='*60}")
-        print("STARTING CRYPTO HEDGE FUND AGENT")
+        print("STARTING BAGGINS CAPITAL V3")
         print(f"{'='*60}")
 
         cycle_count = 0
@@ -1415,37 +1958,81 @@ Respond in JSON:
         try:
             while True:
                 cycle_count += 1
-                # Weather cycle FIRST -- weather gets seniority on funds
+
+                # ══════════════════════════════════════════════════════
+                # STEP 0: Market Scout — pre-screen all markets
+                # ══════════════════════════════════════════════════════
+                try:
+                    self._scout_queues = self.scout.scan()
+                    # V3.1: Log Scout metadata for Historian
+                    try:
+                        depths = self.scout.get_queue_depths()
+                        drops = self.scout.get_drop_summary()
+                        if drops:
+                            top_drops = sorted(drops.items(), key=lambda x: x[1], reverse=True)[:3]
+                            drop_str = ", ".join(f"{k}: {v}" for k, v in top_drops)
+                            print(f"  [SCOUT] Top drop reasons: {drop_str}")
+                    except Exception:
+                        pass
+                except Exception as e:
+                    print(f"  [SCOUT] Scan error (falling back to direct fetch): {e}")
+                    self._scout_queues = {}
+
+                # ══════════════════════════════════════════════════════
+                # V3 STEPS 1-7: Pre-trading checks
+                # ══════════════════════════════════════════════════════
+                trading_allowed = self._run_v3_pre_trading_checks()
+                if not trading_allowed:
+                    print("[MANAGER] Trading halted — CFO unavailable")
+                    time.sleep(CRYPTO_SCAN_INTERVAL)
+                    continue
+
+                # ══════════════════════════════════════════════════════
+                # STEP 8: Run eligible departments
+                # ══════════════════════════════════════════════════════
+
+                # Weather cycle FIRST — weather gets seniority on funds
                 if self.weather_agent:
                     pause_weather = os.path.exists(os.path.join(os.path.dirname(os.path.abspath(__file__)), '.pause_weather'))
                     if not pause_weather:
-                        self.weather_agent.run_weather_cycle(
-                            available_balance=self.wallet.available,
-                            wallet=self.wallet
-                        )
+                        eligible, reason = self._is_department_eligible('weather')
+                        if eligible:
+                            self.weather_agent.run_weather_cycle(
+                                available_balance=self.wallet.available,
+                                wallet=self.wallet,
+                                scout_weather_events=self.scout.get_weather_events() if self._scout_queues else None,
+                                risk_manager=self.risk_manager,
+                                compliance=self.compliance,
+                                intel_package=self._get_liaison_package('weather'),
+                            )
                     elif cycle_count == 1:
                         print("[PAUSED] Weather module paused via .pause_weather file")
 
                 # Scalper cycle (Up/Down 15-min markets)
                 if getattr(__import__('hedge_fund_config'), 'ENABLE_UPDOWN_MODULE', False):
                     try:
-                        run_scalper_cycle(
-                            bankr=self.bankr,
-                            wallet=self.wallet,
-                            dry_run=self.dry_run
-                        )
+                        eligible, reason = self._is_department_eligible('updown')
+                        if eligible:
+                            run_scalper_cycle(
+                                bankr=self.bankr,
+                                wallet=self.wallet,
+                                dry_run=self.dry_run,
+                                risk_manager=self.risk_manager,
+                                compliance=self.compliance,
+                                intel_package=self._get_liaison_package('updown'),
+                            )
                     except Exception as e:
                         print(f"[SCALPER] Cycle error: {e}")
 
-                # Crypto cycle SECOND -- weather gets first pick
+                # Crypto cycle — full 6-step bet protocol
                 if getattr(__import__('hedge_fund_config'), 'ENABLE_CRYPTO_MODULE', True):
                     pause_crypto = os.path.exists(os.path.join(os.path.dirname(os.path.abspath(__file__)), '.pause_crypto'))
                     if not pause_crypto:
-                        self.run_crypto_cycle()
+                        self.run_crypto_cycle(scout_queue=self._scout_queues.get('crypto'))
                     elif cycle_count == 1:
                         print("[PAUSED] Crypto module paused via .pause_crypto file")
 
-                # Avantis leverage trading THIRD
+                # Avantis leverage trading
                 if self.avantis_signals and self.avantis_executor:
                     try:
                         self.run_avantis_cycle()
@@ -1456,39 +2043,58 @@ Respond in JSON:
                 # Sports Analyst (Baggins' Buddy)
                 if self.sports_analyst:
                     try:
-                        self.sports_analyst.run_sports_cycle(
-                            bankr=self.bankr,
-                            wallet=self.wallet,
-                            dry_run=self.dry_run
-                        )
+                        eligible, reason = self._is_department_eligible('sports')
+                        if eligible:
+                            self.sports_analyst.run_sports_cycle(
+                                bankr=self.bankr,
+                                wallet=self.wallet,
+                                dry_run=self.dry_run,
+                                scout_queue=self.scout.get_sports_events() if self._scout_queues else None,
+                                risk_manager=self.risk_manager,
+                                compliance=self.compliance,
+                                intel_package=self._get_liaison_package('sports'),
+                            )
                     except Exception as e:
                         print(f"[BUDDY] Cycle error: {e}")
 
-                # Unified resolver: Bankr claim (10 min) + weather data (1h)
+                # ══════════════════════════════════════════════════════
+                # SETTLEMENT + MONITORING
+                # ══════════════════════════════════════════════════════
+
+                # Settlement Clerk: Bankr claim (10 min) + weather data (1h)
                 self.resolver.run()
 
-                self._maybe_check_positions()   # 24h AI safety net
+                # Position checks + AI heartbeat
+                self._maybe_check_positions()
                 self._run_periodic_heartbeat()
+
+                # ══════════════════════════════════════════════════════
+                # STEP 9: Detective review (30h interval)
+                # ══════════════════════════════════════════════════════
+                self._review_detective_findings()
                 self._run_pattern_analysis()
+
+                # ══════════════════════════════════════════════════════
+                # STEP 10: Summaries, balance, daily reset
+                # ══════════════════════════════════════════════════════
                 self.periodic_balance_check()
                 self.send_results_summary()
                 self.check_daily_reset()
-
-                # Write shared status for Baggins monitoring
                 self._write_shared_status()
 
-                # Sleep for the shortest cycle interval (rapid = 5 min)
-                print(f"\n[MANAGER] Next cycle in {CRYPTO_SCAN_INTERVAL//60} minutes...")
+                # Sleep for the shortest cycle interval
+                print(f"\n[MANAGER] V3 cycle #{self._v3_cycle_count} complete. Next in {CRYPTO_SCAN_INTERVAL//60} min...")
                 time.sleep(CRYPTO_SCAN_INTERVAL)
 
         except KeyboardInterrupt:
             print(f"\n\n{'='*60}")
-            print("AGENT STOPPED")
+            print("BAGGINS CAPITAL V3 STOPPED")
             print(f"{'='*60}")
             print(f"Total Cycles: {cycle_count}")
+            print(f"V3 Cycles: {self._v3_cycle_count}")
             print(f"Final Balance: ${self.balance:.2f}")
 
-            summary = self.tracker.get_summary()
+            summary = self.db_reader.get_summary()
             print(f"\nTotal Bets: {summary['total_bets']}")
             print(f"Win Rate: {summary['win_rate']*100:.1f}%")
             print(f"Total Profit: ${summary['total_profit']:+.2f}")

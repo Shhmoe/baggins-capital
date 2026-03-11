@@ -1,24 +1,46 @@
 """
-Wallet Coordinator - Central balance & risk manager for Hedge Fund Agent
-Single source of truth for both crypto and weather modules.
-Replaces per-module balance tracking with unified position registry.
+The CFO — Executive Department
+Baggins Capital V3
+
+Single source of truth for ALL capital math. Adaptive limits that respond
+to live performance data. No other employee calculates balance math.
+
+V3 Upgrades:
+  - Deployment cap: 60-80% tiered by 7d blended win rate (weekly at MONDAY_OPEN_HOOK)
+  - Reserve floor: max($5, balance × 8%)
+  - Bet sizing ceiling: 15% + confidence multiplier
+  - Position limit: CLAMP(balance÷8, 15, 40)
+  - Full CFOState object on every query
+  - Recalculates on 10%+ balance change
+
+Department: Executive
+Reports to: The Manager
 """
 
 import re
-import sqlite3
+import math
 from datetime import datetime, timedelta
 
 
 class WalletCoordinator:
-    """Central balance + risk manager. Single source of truth for both modules."""
+    """Adaptive CFO. Single source of capital truth."""
 
-    # Risk config
-    MAX_TOTAL_DEPLOYMENT_PCT = 0.70   # 70% cap across all modules
-    MIN_RESERVE = 5.0                  # Always keep $5
-    MAX_SINGLE_BET_PCT = 0.30          # No bet > 30% of available
-    WEATHER_BUDGET_FLOOR_PCT = 0.50    # Reserve 50% of deployable funds for weather
-    WALLET_SYNC_HOURS = 4              # Sync every 4h
-    MAX_TOTAL_CONCURRENT = 25          # Hard cap all positions (weather-primary)
+    # ── Hard constants (never change) ──
+    ABSOLUTE_MIN_RESERVE = 5.0         # $5 floor — non-negotiable
+    WALLET_SYNC_HOURS = 4
+
+    # ── Adaptive defaults (recalculated weekly) ──
+    _deployment_cap_pct = 0.70         # Current tier
+    _position_limit = 25               # Current limit
+    _bet_ceiling_pct = 0.15            # 15% of remaining deployable
+
+    # Deployment cap tiers by 7d blended win rate
+    DEPLOYMENT_TIERS = [
+        (0.00, 0.45, 0.60, 'CONSERVATIVE'),  # WR < 45% → 60%
+        (0.45, 0.55, 0.70, 'NEUTRAL'),        # 45-55% → 70%
+        (0.55, 0.65, 0.75, 'GROWTH'),         # 55-65% → 75%
+        (0.65, 1.01, 0.80, 'STRONG'),         # 65%+ → 80%
+    ]
 
     def __init__(self, bankr, tracker, starting_balance, dry_run=False):
         self.bankr = bankr
@@ -31,71 +53,164 @@ class WalletCoordinator:
         self._last_sync = None
         self._withdrawals_today = 0.0
 
-    # ------------------------------------------------------------------
-    # Properties
-    # ------------------------------------------------------------------
+        # Adaptive state
+        self._win_rate_7d = 0.50
+        self._deployment_cap_band = 'NEUTRAL'
+        self._last_cap_update = None
+        self._last_balance_for_recalc = float(starting_balance)
 
-    @property
-    def available(self):
-        return self._available
+    # ══════════════════════════════════════════════════════════════
+    # CFO STATE OBJECT — Full response on every query
+    # ══════════════════════════════════════════════════════════════
 
-    @available.setter
-    def available(self, value):
-        self._available = float(value)
+    def get_state(self):
+        """Return full CFOState dict. All four adaptive values included."""
+        total = self._available + self.total_deployed()
+        reserve = self._calculate_reserve_floor(total)
+        available_after_reserve = max(0, self._available - reserve)
+        max_deployable = total * self._deployment_cap_pct
+        remaining_deployable = max(0, max_deployable - self.total_deployed())
+        per_bet_ceiling = remaining_deployable * self._bet_ceiling_pct
 
-    @property
-    def starting_daily(self):
-        return self._starting_daily
+        return {
+            'total_balance': round(total, 2),
+            'reserve_floor': round(reserve, 2),
+            'available_capital': round(available_after_reserve, 2),
+            'deployment_cap_pct': self._deployment_cap_pct,
+            'max_deployable': round(max_deployable, 2),
+            'currently_deployed': round(self.total_deployed(), 2),
+            'remaining_deployable': round(remaining_deployable, 2),
+            'per_bet_ceiling': round(per_bet_ceiling, 2),
+            'position_limit': self._position_limit,
+            'open_positions': self.total_position_count(),
+            'positions_remaining': max(0, self._position_limit - self.total_position_count()),
+            'win_rate_7d': self._win_rate_7d,
+            'deployment_cap_band': self._deployment_cap_band,
+            'last_cap_update': self._last_cap_update,
+            'next_cap_review': 'MONDAY_OPEN_HOOK',
+        }
 
-    @starting_daily.setter
-    def starting_daily(self, value):
-        self._starting_daily = float(value)
+    # ══════════════════════════════════════════════════════════════
+    # ADAPTIVE RECALCULATION
+    # ══════════════════════════════════════════════════════════════
 
-    # ------------------------------------------------------------------
-    # Risk checks
-    # ------------------------------------------------------------------
+    def recalculate_adaptive_limits(self, win_rate_7d=None):
+        """Recalculate all adaptive parameters. Called at MONDAY_OPEN_HOOK
+        and on 10%+ balance change."""
+        total = self._available + self.total_deployed()
 
-    def can_bet(self, module, amount):
-        """Check if a bet is allowed. Returns (bool, reason)."""
+        # Update win rate if provided (from Historian/DBReader)
+        if win_rate_7d is not None:
+            self._win_rate_7d = win_rate_7d
+
+        # ── Deployment cap tier ──
+        for wr_low, wr_high, cap, band in self.DEPLOYMENT_TIERS:
+            if wr_low <= self._win_rate_7d < wr_high:
+                old_cap = self._deployment_cap_pct
+                self._deployment_cap_pct = cap
+                self._deployment_cap_band = band
+                if old_cap != cap:
+                    print(f"[CFO] Deployment cap: {old_cap:.0%} → {cap:.0%} ({band}, WR={self._win_rate_7d:.1%})")
+                break
+
+        # ── Position limit: CLAMP(balance÷8, 15, 40) ──
+        old_limit = self._position_limit
+        self._position_limit = max(15, min(40, int(total / 8)))
+        if old_limit != self._position_limit:
+            print(f"[CFO] Position limit: {old_limit} → {self._position_limit}")
+
+        self._last_cap_update = datetime.now().isoformat()
+        self._last_balance_for_recalc = total
+
+    def _check_balance_triggered_recalc(self):
+        """Check if balance changed 10%+ since last recalc — trigger if so."""
+        total = self._available + self.total_deployed()
+        if self._last_balance_for_recalc > 0:
+            change = abs(total - self._last_balance_for_recalc) / self._last_balance_for_recalc
+            if change >= 0.10:
+                print(f"[CFO] Balance changed {change:.0%} — recalculating adaptive limits")
+                self.recalculate_adaptive_limits()
+
+    def on_monday_open(self, payload=None):
+        """Hook handler: weekly adaptive recalculation."""
+        print("[CFO] MONDAY_OPEN_HOOK — recalculating adaptive limits")
+        # Caller should pass win_rate_7d from Historian/DBReader
+        wr = payload.get('win_rate_7d', self._win_rate_7d) if payload else self._win_rate_7d
+        self.recalculate_adaptive_limits(win_rate_7d=wr)
+
+    # ══════════════════════════════════════════════════════════════
+    # RESERVE FLOOR
+    # ══════════════════════════════════════════════════════════════
+
+    def _calculate_reserve_floor(self, total_balance):
+        """Reserve floor: max($5, balance × 8%)."""
+        return max(self.ABSOLUTE_MIN_RESERVE, total_balance * 0.08)
+
+    # ══════════════════════════════════════════════════════════════
+    # BET SIZING — 15% ceiling + confidence multiplier
+    # ══════════════════════════════════════════════════════════════
+
+    def get_bet_size(self, flat_amount, confidence=None):
+        """Calculate actual bet size with confidence multiplier.
+
+        - Ceiling: 15% of remaining deployable
+        - Confidence multiplier scales high-conviction bets up to ceiling
+        - Low confidence = flat amount unchanged
+        - confidence 80+ gets proportional boost
+        """
+        state = self.get_state()
+        ceiling = state['per_bet_ceiling']
+
+        if confidence is None or confidence < 80:
+            # Standard flat sizing, capped at ceiling
+            return min(flat_amount, ceiling)
+
+        # Confidence multiplier: 80→1.0x, 90→1.25x, 100→1.5x
+        multiplier = 1.0 + (confidence - 80) * 0.025
+        sized = flat_amount * multiplier
+        return min(sized, ceiling)
+
+    # ══════════════════════════════════════════════════════════════
+    # RISK CHECKS (V3 — uses adaptive limits)
+    # ══════════════════════════════════════════════════════════════
+
+    def can_bet(self, module, amount, confidence=None):
+        """Check if a bet is allowed. Returns (bool, reason).
+        Uses adaptive deployment cap, reserve floor, position limit."""
         amount = float(amount)
+        total = self._available + self.total_deployed()
 
-        # Reserve check
-        if self._available - amount < self.MIN_RESERVE:
-            return False, f"Would leave balance below ${self.MIN_RESERVE:.2f} reserve"
+        # Check for balance-triggered recalc
+        self._check_balance_triggered_recalc()
 
-        # Weather budget floor — crypto/avantis can't starve weather
-        if module != 'weather':
-            weather_deployed = sum(p.get('_amount', 0) for p in self._positions.get('weather', []))
-            total_funds = self._available + self.total_deployed()
-            max_deploy = total_funds * self.MAX_TOTAL_DEPLOYMENT_PCT
-            weather_floor = max_deploy * self.WEATHER_BUDGET_FLOOR_PCT
-            non_weather_ceiling = max_deploy - weather_floor
-            non_weather_deployed = self.total_deployed() - weather_deployed
-            if non_weather_deployed + amount > non_weather_ceiling:
-                return False, f"Non-weather budget ceiling reached (reserving {self.WEATHER_BUDGET_FLOOR_PCT:.0%} for weather)"
+        # Reserve check (adaptive: max($5, 8%))
+        reserve = self._calculate_reserve_floor(total)
+        if self._available - amount < reserve:
+            return False, f"Would leave balance below ${reserve:.2f} reserve"
 
-        # Single bet size check
-        if amount > self._available * self.MAX_SINGLE_BET_PCT:
-            return False, f"Bet ${amount:.2f} > {self.MAX_SINGLE_BET_PCT:.0%} of available ${self._available:.2f}"
-
-        # Total deployment check
-        total_funds = self._available + self.total_deployed()
-        if (self.total_deployed() + amount) > total_funds * self.MAX_TOTAL_DEPLOYMENT_PCT:
+        # Deployment cap check (adaptive: 60-80%)
+        max_deployable = total * self._deployment_cap_pct
+        if (self.total_deployed() + amount) > max_deployable:
             return False, (
                 f"Would deploy ${self.total_deployed() + amount:.2f} "
-                f"(>{total_funds * self.MAX_TOTAL_DEPLOYMENT_PCT:.2f} = "
-                f"{self.MAX_TOTAL_DEPLOYMENT_PCT:.0%} of total)"
+                f"(>{max_deployable:.2f} = {self._deployment_cap_pct:.0%} of total)"
             )
 
-        # Concurrent position check
-        if self.total_position_count() >= self.MAX_TOTAL_CONCURRENT:
-            return False, f"At max {self.MAX_TOTAL_CONCURRENT} total concurrent positions"
+        # Bet sizing ceiling (15% of remaining deployable)
+        remaining_deployable = max(0, max_deployable - self.total_deployed())
+        ceiling = remaining_deployable * self._bet_ceiling_pct
+        if amount > ceiling:
+            return False, f"Bet ${amount:.2f} > ceiling ${ceiling:.2f} (15% of remaining deployable)"
+
+        # Position limit (adaptive: CLAMP(balance÷8, 15, 40))
+        if self.total_position_count() >= self._position_limit:
+            return False, f"At max {self._position_limit} concurrent positions"
 
         return True, "OK"
 
-    # ------------------------------------------------------------------
-    # Fund management
-    # ------------------------------------------------------------------
+    # ══════════════════════════════════════════════════════════════
+    # FUND MANAGEMENT (unchanged from V2)
+    # ══════════════════════════════════════════════════════════════
 
     def reserve_funds(self, module, amount, position_data):
         """Deduct funds and register a position."""
@@ -113,7 +228,6 @@ class WalletCoordinator:
         returned_amount = float(returned_amount)
         self._available += returned_amount
 
-        # Remove from position registry
         before = len(self._positions[module])
         self._positions[module] = [
             p for p in self._positions[module]
@@ -122,9 +236,25 @@ class WalletCoordinator:
         removed = before - len(self._positions[module])
         print(f"[CFO] Released ${returned_amount:.2f} from {module} (removed {removed} pos) | Available: ${self._available:.2f}")
 
-    # ------------------------------------------------------------------
-    # Position queries
-    # ------------------------------------------------------------------
+    # ══════════════════════════════════════════════════════════════
+    # POSITION QUERIES (unchanged)
+    # ══════════════════════════════════════════════════════════════
+
+    @property
+    def available(self):
+        return self._available
+
+    @available.setter
+    def available(self, value):
+        self._available = float(value)
+
+    @property
+    def starting_daily(self):
+        return self._starting_daily
+
+    @starting_daily.setter
+    def starting_daily(self, value):
+        self._starting_daily = float(value)
 
     def total_deployed(self):
         total = 0.0
@@ -142,21 +272,17 @@ class WalletCoordinator:
     def total_position_count(self):
         return sum(len(positions) for positions in self._positions.values())
 
-    # ------------------------------------------------------------------
-    # Startup reload
-    # ------------------------------------------------------------------
+    # ══════════════════════════════════════════════════════════════
+    # STARTUP RELOAD (unchanged)
+    # ══════════════════════════════════════════════════════════════
 
     def load_positions_from_db(self):
         """Load pending bets from DB on startup. Returns crypto positions list."""
         try:
-            conn = sqlite3.connect(self.tracker.db_path)
-            c = conn.cursor()
-            c.execute("""
+            rows = self.tracker._fetchall("""
                 SELECT id, market_id, market_title, amount, side, odds, category, reasoning, cycle_type
                 FROM bets WHERE status = 'pending'
             """)
-            rows = c.fetchall()
-            conn.close()
 
             self._positions = {'crypto': [], 'weather': [], 'avantis': []}
             total_deducted = 0.0
@@ -166,7 +292,6 @@ class WalletCoordinator:
                 reasoning = r[7] if len(r) > 7 else ''
                 cycle_type = r[8] if len(r) > 8 else 'short'
 
-                # Determine term from cycle_type or reasoning
                 if cycle_type in ('rapid', 'short', 'long'):
                     term = cycle_type
                 else:
@@ -198,15 +323,18 @@ class WalletCoordinator:
                       f"(crypto: {len(self._positions['crypto'])}, weather: {len(self._positions['weather'])}, avantis: {len(self._positions['avantis'])})")
                 print(f"[CFO] Deducted ${total_deducted:.2f} from balance -> ${self._available:.2f}")
 
+            # Initial adaptive calc
+            self.recalculate_adaptive_limits()
+
             return list(self._positions['crypto'])
 
         except Exception as e:
             print(f"[CFO] Failed to load positions: {e}")
             return []
 
-    # ------------------------------------------------------------------
-    # Wallet sync
-    # ------------------------------------------------------------------
+    # ══════════════════════════════════════════════════════════════
+    # WALLET SYNC (unchanged)
+    # ══════════════════════════════════════════════════════════════
 
     def sync_with_wallet(self, update_starting=True):
         """Sync available balance with actual Polygon USDC via Bankr."""
@@ -231,6 +359,10 @@ class WalletCoordinator:
                 print(f"[CFO] Available USDC: ${total_usdc:.2f}")
                 print(f"[CFO] Deployed in bets: ${deployed:.2f}")
                 print(f"[CFO] Total tracked: ${total_usdc + deployed:.2f}")
+
+                # Check if balance change triggers adaptive recalc
+                self._check_balance_triggered_recalc()
+
                 return total_usdc
             else:
                 print(f"[CFO] Check failed: {result.get('error')}")
@@ -241,16 +373,14 @@ class WalletCoordinator:
         return self._available
 
     def get_polymarket_balance(self):
-        """Get Polygon USDC balance for weather/crypto betting. Returns float."""
+        """Get Polygon USDC balance for weather/crypto betting."""
         if self.dry_run:
             return self._available
-        
         try:
             result = self.bankr.check_polygon_balance()
             if result.get('success'):
                 response = result.get('response', '')
-                total_usdc = self._parse_usdc_from_response(response)
-                return total_usdc
+                return self._parse_usdc_from_response(response)
             else:
                 print(f"[CFO] Polygon check failed: {result.get('error')}")
                 return self._available
@@ -259,33 +389,23 @@ class WalletCoordinator:
             return self._available
 
     def get_avantis_balance(self):
-        """Get Base USDC + ETH balance for Avantis leverage trading. Returns dict."""
+        """Get Base USDC + ETH balance for Avantis leverage trading."""
         if self.dry_run:
             return {'usdc': self._available, 'eth': 0.0, 'total_for_trading': self._available}
-        
         try:
             result = self.bankr.check_base_balance()
             if result.get('success'):
                 response = result.get('response', '')
-                print(f"[CFO] Base raw response: {response[:200]}")
                 usdc = self._parse_usdc_from_response(response)
                 eth = self._parse_eth_from_response(response)
-                # If parse returned 0 but we know there's funds, use last known
                 if usdc == 0 and hasattr(self, '_last_base_usdc') and self._last_base_usdc > 0:
-                    print(f"[CFO] Base parse returned $0, using last known: ${self._last_base_usdc:.2f}")
                     usdc = self._last_base_usdc
                 elif usdc > 0:
                     self._last_base_usdc = usdc
-                return {
-                    'usdc': usdc,
-                    'eth': eth,
-                    'total_for_trading': usdc
-                }
+                return {'usdc': usdc, 'eth': eth, 'total_for_trading': usdc}
             else:
                 print(f"[CFO] Base check failed: {result.get('error')}")
-                # Fallback to last known
                 if hasattr(self, '_last_base_usdc') and self._last_base_usdc > 0:
-                    print(f"[CFO] Using last known Base USDC: ${self._last_base_usdc:.2f}")
                     return {'usdc': self._last_base_usdc, 'eth': 0.0, 'total_for_trading': self._last_base_usdc}
                 return {'usdc': 0.0, 'eth': 0.0, 'total_for_trading': 0.0}
         except Exception as e:
@@ -293,7 +413,6 @@ class WalletCoordinator:
             return {'usdc': 0.0, 'eth': 0.0, 'total_for_trading': 0.0}
 
     def periodic_sync(self):
-        """Sync if enough time has elapsed."""
         if self.dry_run:
             return
         if self._last_sync is None:
@@ -311,9 +430,9 @@ class WalletCoordinator:
         else:
             self._starting_daily = self._available
 
-    # ------------------------------------------------------------------
-    # Status
-    # ------------------------------------------------------------------
+    # ══════════════════════════════════════════════════════════════
+    # STATUS
+    # ══════════════════════════════════════════════════════════════
 
     def status_summary(self):
         """Human-readable status line for logs."""
@@ -326,12 +445,12 @@ class WalletCoordinator:
         return (
             f"Available: ${self._available:.2f} | "
             f"Deployed: ${deployed:.2f} ({pct:.0f}%) | "
-            f"Positions: {crypto_count}C + {weather_count}W + {avantis_count}A = {crypto_count + weather_count + avantis_count} | "
+            f"Positions: {crypto_count}C + {weather_count}W + {avantis_count}A = {crypto_count + weather_count + avantis_count}/{self._position_limit} | "
+            f"Cap: {self._deployment_cap_pct:.0%} ({self._deployment_cap_band}) | "
             f"Total: ${total:.2f}"
         )
 
     def record_withdrawal(self, amount, purpose="fund_transfer"):
-        """Record a withdrawal so balance sync doesn't treat it as a loss."""
         self._withdrawals_today += amount
         self._starting_daily -= amount
         self._available -= amount
@@ -339,60 +458,42 @@ class WalletCoordinator:
         print(f"[CFO] Starting daily adjusted: ${self._starting_daily:.2f}")
         print(f"[CFO] Available adjusted: ${self._available:.2f}")
 
-    # ------------------------------------------------------------------
-    # Helpers
-    # ------------------------------------------------------------------
+    # ══════════════════════════════════════════════════════════════
+    # HELPERS (unchanged)
+    # ══════════════════════════════════════════════════════════════
 
     @staticmethod
     def _parse_usdc_from_response(response):
-        """Extract USDC amount from Bankr response text."""
         total_usdc = 0
-
-        # Pattern 1: "USD Coin (PoS) - 100.709062" or "USDC - 31.669" or "USDC.e - 41.67"
         m = re.search(r'USD\s+Coin\s*\([^)]+\)\s*[-:]\s*(\d+(?:\.\d+)?)', response, re.IGNORECASE)
         if m:
             total_usdc = float(m.group(1))
-        
-        # Pattern 1b: "USDC - 31.669" or "USDC.e - 41.67"
         if total_usdc == 0:
             m = re.search(r'USDC(?:\.e)?\s*[-:]\s*(\d+(?:\.\d+)?)', response, re.IGNORECASE)
             if m:
                 total_usdc = float(m.group(1))
-
-        # Pattern 2: "$31.67" or "$ 31.67"
         if total_usdc == 0:
             amounts = re.findall(r'\$\s*(\d+(?:\.\d+)?)', response)
             if amounts:
                 total_usdc = max(float(a) for a in amounts)
-
-        # Pattern 3: "31.67 USDC"
         if total_usdc == 0:
             amounts = re.findall(r'(\d+(?:\.\d+)?)\s*USDC', response, re.IGNORECASE)
             if amounts:
                 total_usdc = sum(float(a) for a in amounts)
-
-        # Pattern 4: "total balance ... $31.67"
         if total_usdc == 0:
             m = re.search(r'total\s+balance[^$]*?\$(\d+(?:\.\d+)?)', response, re.IGNORECASE)
             if m:
                 total_usdc = float(m.group(1))
-
         return total_usdc
 
     @staticmethod
     def _parse_eth_from_response(response):
-        """Extract ETH amount from Bankr response text."""
         total_eth = 0
-
-        # Pattern 1: "ETH - 0.5" or "Ethereum - 0.5"
         m = re.search(r'(?:ETH|Ethereum)\s*[-:]\s*(\d+(?:\.\d+)?)', response, re.IGNORECASE)
         if m:
             total_eth = float(m.group(1))
-        
-        # Pattern 2: "0.5 ETH"
         if total_eth == 0:
             amounts = re.findall(r'(\d+(?:\.\d+)?)\s*ETH', response, re.IGNORECASE)
             if amounts:
                 total_eth = sum(float(a) for a in amounts)
-
         return total_eth

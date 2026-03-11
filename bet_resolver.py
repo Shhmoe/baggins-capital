@@ -18,7 +18,6 @@ import os
 import re
 import json
 import time
-import sqlite3
 from datetime import datetime, timedelta, timezone
 
 
@@ -46,28 +45,8 @@ class BetResolver:
         self._ensure_tables()
 
     def _ensure_tables(self):
-        """Create resolver tables and add resolved_by column if missing."""
-        conn = sqlite3.connect(self.db_path, timeout=30)
-        c = conn.cursor()
-        c.execute("""
-            CREATE TABLE IF NOT EXISTS bet_resolutions (
-                id INTEGER PRIMARY KEY AUTOINCREMENT,
-                bet_id INTEGER NOT NULL,
-                resolved_at TEXT NOT NULL,
-                resolved_by TEXT NOT NULL,
-                won INTEGER,
-                profit REAL,
-                redeemed_amount REAL,
-                actual_data TEXT,
-                FOREIGN KEY (bet_id) REFERENCES bets(id)
-            )
-        """)
-        try:
-            c.execute("ALTER TABLE bets ADD COLUMN resolved_by TEXT DEFAULT NULL")
-        except Exception:
-            pass
-        conn.commit()
-        conn.close()
+        """Schema is now owned by The Archivist — no-op."""
+        pass
 
     # ==================================================================
     # Main entry point
@@ -152,6 +131,8 @@ class BetResolver:
         portfolio = portfolio_raw.lower()
         print(f"  [SETTLEMENT CLERK] {portfolio_raw[:1500]}")
 
+        resolved = []
+
         # --- Step 1.5: Bulk redeem all available shares ---
         redeem_result = self.bankr._run_prompt(
             'Redeem all available shares on Polymarket. '
@@ -163,6 +144,16 @@ class BetResolver:
             print(f'  [SETTLEMENT CLERK] Bulk redeem: {redeem_resp[:500]}')
         else:
             print(f'  [SETTLEMENT CLERK] Bulk redeem failed, continuing with individual checks')
+            redeem_resp = ''
+
+        # --- Step 1.6: Parse bulk redeem for resolved bets ---
+        if redeem_resp:
+            bulk_resolved = self._resolve_from_bulk_redeem(redeem_resp, pending)
+            if bulk_resolved:
+                resolved.extend(bulk_resolved)
+                resolved_ids = set(r['bet_id'] for r in bulk_resolved)
+                pending = [b for b in pending if b['id'] not in resolved_ids]
+                print(f'  [SETTLEMENT CLERK] Bulk redeem resolved {len(bulk_resolved)} bets')
 
         time.sleep(3)
 
@@ -180,28 +171,18 @@ class BetResolver:
 
         # Log portfolio + redeem data to DB for other employees
         try:
-            _log_conn = sqlite3.connect(self.db_path, timeout=30)
-            _log_conn.execute(
-                "CREATE TABLE IF NOT EXISTS portfolio_checks ("
-                "id INTEGER PRIMARY KEY AUTOINCREMENT, "
-                "checked_at TEXT NOT NULL, "
-                "portfolio_raw TEXT, "
-                "redeem_response TEXT, "
-                "pending_count INTEGER, "
-                "resolved_count INTEGER DEFAULT 0)"
-            )
+            from archivist import Archivist
+            _arch = Archivist(self.db_path)
             _redeem_text = redeem_resp if 'redeem_resp' in dir() else None
-            _log_conn.execute(
-                "INSERT INTO portfolio_checks (checked_at, portfolio_raw, redeem_response, pending_count) VALUES (?, ?, ?, ?)",
-                (datetime.now(timezone.utc).isoformat(), portfolio_raw[:5000], _redeem_text[:5000] if _redeem_text else None, len(pending))
+            _arch.record_portfolio_check(
+                portfolio_raw=portfolio_raw[:5000],
+                redeem_response=_redeem_text[:5000] if _redeem_text else None,
+                pending_count=len(pending),
             )
-            _log_conn.commit()
-            _log_conn.close()
         except Exception as e:
             print(f"  [SETTLEMENT CLERK] DB log error: {e}")
 
         # --- Step 2: Match each pending bet to portfolio ---
-        resolved = []
         for bet in pending:
             title = bet['market_title']
             title_lower = title.lower()
@@ -453,6 +434,61 @@ class BetResolver:
 
         return {'bet_id': bet['id'], 'won': won, 'profit': profit}
 
+    def _resolve_from_bulk_redeem(self, redeem_resp, pending):
+        """Parse bulk redeem response and resolve any bets that were redeemed.
+
+        After Bankr redeems positions, they disappear from the wallet.
+        This parses the redeem response to catch them BEFORE they vanish.
+        Returns list of resolved bet dicts.
+        """
+        if not redeem_resp:
+            return []
+
+        resp_lower = redeem_resp.lower()
+
+        # Quick check: did anything actually get redeemed?
+        if not any(kw in resp_lower for kw in ['redeemed', 'returned', 'redemption', 'success']):
+            return []
+        if 'no positions' in resp_lower or 'none of them' in resp_lower or 'no shares' in resp_lower:
+            return []
+
+        resolved = []
+
+        for bet in pending:
+            title = bet['market_title']
+            amount = bet['amount']
+
+            # Check if this bet title appears in the redeem response
+            keywords = self._extract_match_keywords(title)
+            if not keywords or len(keywords) < 2:
+                continue
+
+            if not all(kw in resp_lower for kw in keywords):
+                continue
+
+            # Found a match - extract USDC amount near the match
+            section = self._get_portfolio_section(resp_lower, keywords)
+            if not section:
+                continue
+
+            # Parse USDC from the section
+            usdc = self._parse_usdc_amount(section, section, amount)
+
+            if usdc is not None:
+                self.resolve_bet(bet['id'], won=(usdc > amount * 0.01),
+                                 profit=usdc - amount,
+                                 source='bankr_bulk_redeem',
+                                 redeemed_amount=usdc)
+                resolved.append({'bet_id': bet['id'], 'won': usdc > amount * 0.01,
+                                 'profit': usdc - amount})
+                print(f"  [SETTLEMENT CLERK] Bulk redeem resolved #{bet['id']}: "
+                      f"redeemed={usdc:.4f} USDC | {title[:60]}")
+            else:
+                # Bankr mentioned this market but no clear USDC amount
+                print(f"  [SETTLEMENT CLERK] Bulk redeem mentions #{bet['id']} but no clear USDC. "
+                      f"Will retry individual redeem next cycle.")
+
+        return resolved
     def _parse_usdc_amount(self, resp, resp_lower, bet_amount):
         """Parse USDC amount from Bankr redemption response.
 
@@ -775,16 +811,14 @@ class BetResolver:
         If redeemed_amount is provided, it overrides any passed-in profit.
         Balance tracking uses wallet query only (no manual calc).
         """
-        conn = sqlite3.connect(self.db_path, timeout=30)
-        conn.row_factory = sqlite3.Row
+        from archivist import Archivist
+        _arch = Archivist(self.db_path)
 
-        bet = conn.execute("SELECT * FROM bets WHERE id = ?", (bet_id,)).fetchone()
+        bet = _arch.get_bet(bet_id)
         if not bet:
-            conn.close()
             return
 
         if bet['status'] == 'resolved' and source != 'weather_data':
-            conn.close()
             return
 
         now = datetime.now(timezone.utc).isoformat()
@@ -812,14 +846,14 @@ class BetResolver:
             except Exception:
                 pass
 
-        conn.execute("""
+        _arch._execute("""
             UPDATE bets SET status = 'resolved', resolved_at = ?,
                 won = ?, profit = ?, resolved_by = ?,
                 balance_before = ?, balance_after = ?
             WHERE id = ? AND status = 'pending'
         """, (now, int(won), profit, source, balance_before, balance_after, bet_id))
 
-        conn.execute("""
+        _arch._execute("""
             INSERT INTO bet_resolutions
                 (bet_id, resolved_at, resolved_by, won, profit,
                  redeemed_amount, actual_data)
@@ -833,15 +867,14 @@ class BetResolver:
         _weather_side = None
         if bet['category'] == 'weather':
             try:
-                _city_row = conn.execute("SELECT city FROM weather_bets WHERE bet_id = ?", (bet_id,)).fetchone()
+                _city_row = _arch._fetchone("SELECT city FROM weather_bets WHERE bet_id = ?", (bet_id,))
                 if _city_row:
                     _weather_city = _city_row[0] if isinstance(_city_row, tuple) else _city_row['city']
                     _weather_side = bet['side'] or ''
             except Exception:
                 pass
 
-        conn.commit()
-        conn.close()
+        _arch._commit()
 
         # Update weather DB gates after resolution (fixes Seoul bypass bug)
         if _weather_city and self.weather_agent:
@@ -888,23 +921,20 @@ class BetResolver:
     # ==================================================================
 
     def _log_audit(self, source, resolved, response_raw):
-        """Log resolution to audit table."""
-        now_str = datetime.now(timezone.utc).isoformat()
-        conn = sqlite3.connect(self.db_path, timeout=30)
-        conn.execute("""
-            INSERT INTO bet_resolutions
-                (bet_id, resolved_at, resolved_by, won, profit,
-                 redeemed_amount, actual_data)
-            VALUES (?, ?, ?, ?, ?, ?, ?)
-        """, (0, now_str, f'{source}_log',
-              len(resolved),
-              sum(r['profit'] for r in resolved), 0,
-              json.dumps({
-                  'matched': len(resolved),
-                  'response': response_raw[:2000]
-              })))
-        conn.commit()
-        conn.close()
+        """Log resolution to audit table via Archivist."""
+        from archivist import Archivist
+        _arch = Archivist(self.db_path)
+        _arch.record_resolution_detail(
+            bet_id=0,
+            resolved_by=f'{source}_log',
+            won=len(resolved),
+            profit=sum(r['profit'] for r in resolved),
+            redeemed_amount=0,
+            actual_data=json.dumps({
+                'matched': len(resolved),
+                'response': response_raw[:2000]
+            }),
+        )
 
     def _is_market_past_date(self, bet):
         """Check if market date has passed. Returns False if market is still live.
@@ -942,14 +972,15 @@ class BetResolver:
         return True
 
     def get_pending_bets(self):
-        """Get all pending bets from DB."""
-        conn = sqlite3.connect(self.db_path, timeout=30)
-        conn.row_factory = sqlite3.Row
-        rows = conn.execute("""
+        """Get all pending bets from DB via Archivist."""
+        from archivist import Archivist
+        _arch = Archivist(self.db_path)
+        rows = _arch._fetchall("""
             SELECT id, market_title, category, cycle_type, side,
                    amount, odds, timestamp
             FROM bets WHERE status = 'pending'
             ORDER BY id ASC
-        """).fetchall()
-        conn.close()
-        return [dict(r) for r in rows]
+        """)
+        cols = ['id', 'market_title', 'category', 'cycle_type', 'side',
+                'amount', 'odds', 'timestamp']
+        return [dict(zip(cols, r)) for r in rows]

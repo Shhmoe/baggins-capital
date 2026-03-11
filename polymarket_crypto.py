@@ -19,6 +19,7 @@ Bet Types:
 
 import re
 import json
+import os
 import math
 import time
 import requests
@@ -26,12 +27,20 @@ from datetime import datetime, timedelta
 from typing import Dict, List, Optional, Tuple
 
 from hedge_fund_config import (
+    PERFORMANCE_DB,
     POLYMARKET_GAMMA_URL,
     CRYPTO_KEYWORDS, CRYPTO_EXCLUDE_KEYWORDS,
     CRYPTO_COINGECKO_IDS,
     CACHE_DURATION,
     CRYPTO_MIN_CONFIDENCE, CRYPTO_MIN_EDGE, CRYPTO_BET_MIN, CRYPTO_BET_MAX,
+    CRYPTO_MODIFIER_WINDOW_DAYS, CRYPTO_MODIFIER_MIN_SAMPLE,
 )
+from company_clock import now_utc, now_et, current_hour_et, status as clock_status
+
+try:
+    from hedge_fund_config import YAHOO_FINANCE_SYMBOLS
+except ImportError:
+    YAHOO_FINANCE_SYMBOLS = {}
 
 
 class CryptoMarketScanner:
@@ -41,6 +50,214 @@ class CryptoMarketScanner:
         self.cache = {}
         self.price_cache = {}
         self.cache_duration = CACHE_DURATION
+        self.db_path = os.path.join(os.path.dirname(os.path.abspath(__file__)), PERFORMANCE_DB)
+        self._hour_mod_cache = None
+        self._hour_mod_cache_time = None
+
+    def _get_hour_modifier(self) -> Dict[int, float]:
+        """Compute per-ET-hour win-rate modifier from rolling 30-day data.
+        Hours with <MIN_SAMPLE bets get neutral 1.0. Cached for 5 min."""
+        # Cache: avoid DB hit on every market evaluation
+        if self._hour_mod_cache is not None and self._hour_mod_cache_time is not None:
+            if (datetime.now() - self._hour_mod_cache_time).total_seconds() < 300:
+                return self._hour_mod_cache
+        try:
+            from hedge_fund_config import CRYPTO_MODIFIER_WINDOW_DAYS, CRYPTO_MODIFIER_MIN_SAMPLE
+        except ImportError:
+            return {}
+        modifiers = {}
+        try:
+            from archivist import Archivist
+            _arch = Archivist(self.db_path)
+            rows = _arch._fetchall("""
+                SELECT timestamp, won FROM bets
+                WHERE category = 'crypto' AND cycle_type != 'updown'
+                AND status = 'resolved' AND won IS NOT NULL
+                AND timestamp >= datetime('now', ?)
+            """, (f'-{CRYPTO_MODIFIER_WINDOW_DAYS} days',))
+
+            # Bucket by ET hour
+            from company_clock import COMPANY_TZ
+            from datetime import timezone
+            hour_stats = {}  # {hour_et: [wins, total]}
+            for ts_str, won in rows:
+                try:
+                    # Parse UTC timestamp, convert to ET
+                    dt = datetime.fromisoformat(ts_str.replace('Z', '+00:00'))
+                    if dt.tzinfo is None:
+                        dt = dt.replace(tzinfo=timezone.utc)
+                    et_hour = dt.astimezone(COMPANY_TZ).hour
+                    if et_hour not in hour_stats:
+                        hour_stats[et_hour] = [0, 0]
+                    hour_stats[et_hour][1] += 1
+                    if won:
+                        hour_stats[et_hour][0] += 1
+                except Exception:
+                    continue
+
+            for hour, (wins, total) in hour_stats.items():
+                if total >= CRYPTO_MODIFIER_MIN_SAMPLE:
+                    wr = wins / total
+                    mod = 1.0 + (wr - 0.50) * 0.5
+                    modifiers[hour] = max(0.7, min(1.3, mod))
+                else:
+                    modifiers[hour] = 1.0
+
+            if modifiers:
+                print(f"  [CRYPTO TRADER] Hour modifiers (ET): { {h: f'{m:.2f}' for h, m in sorted(modifiers.items())} }")
+        except Exception as e:
+            print(f"  [CRYPTO TRADER] Hour modifier error: {e}")
+        self._hour_mod_cache = modifiers
+        self._hour_mod_cache_time = datetime.now()
+        return modifiers
+
+    def _get_asset_modifier(self, coin_id: str) -> float:
+        """Compute per-asset win-rate modifier vs baseline, rolling 30-day window."""
+        try:
+            from hedge_fund_config import CRYPTO_MODIFIER_WINDOW_DAYS, CRYPTO_MODIFIER_MIN_SAMPLE
+        except ImportError:
+            return 1.0
+        try:
+            from archivist import Archivist
+            _arch = Archivist(self.db_path)
+            window_clause = f'-{CRYPTO_MODIFIER_WINDOW_DAYS} days'
+
+            # Baseline: all crypto WR in window
+            base_row = _arch._fetchone("""
+                SELECT COUNT(*), SUM(CASE WHEN won = 1 THEN 1 ELSE 0 END) FROM bets
+                WHERE category = 'crypto' AND cycle_type != 'updown'
+                AND status = 'resolved' AND won IS NOT NULL
+                AND timestamp >= datetime('now', ?)
+            """, (window_clause,))
+            base_total = base_row[0] if base_row else 0
+            base_wins = base_row[1] if base_row else 0
+            baseline_wr = base_wins / base_total if base_total >= CRYPTO_MODIFIER_MIN_SAMPLE else 0.50
+
+            # Asset-specific: match via market_title LIKE
+            # Build search patterns from coin_id
+            search_term = coin_id.replace('-', ' ')
+            if coin_id == 'bitcoin':
+                like_pattern = '%bitcoin%'
+            elif coin_id == 'ethereum':
+                like_pattern = '%ethereum%'
+            elif coin_id == 'solana':
+                like_pattern = '%solana%'
+            elif coin_id == 'ripple':
+                like_pattern = '%xrp%'
+            else:
+                like_pattern = f'%{search_term}%'
+
+            asset_row = _arch._fetchone("""
+                SELECT COUNT(*), SUM(CASE WHEN won = 1 THEN 1 ELSE 0 END) FROM bets
+                WHERE category = 'crypto' AND cycle_type != 'updown'
+                AND status = 'resolved' AND won IS NOT NULL
+                AND timestamp >= datetime('now', ?)
+                AND LOWER(market_title) LIKE ?
+            """, (window_clause, like_pattern))
+
+            asset_total = asset_row[0] if asset_row else 0
+            asset_wins = asset_row[1] if asset_row else 0
+
+            if asset_total < CRYPTO_MODIFIER_MIN_SAMPLE:
+                return 1.0
+
+            asset_wr = asset_wins / asset_total
+            modifier = 1.0 + (asset_wr - baseline_wr) * 0.4
+            modifier = max(0.75, min(1.25, modifier))
+            print(f"  [CRYPTO TRADER] Asset modifier {coin_id}: {modifier:.2f} (WR={asset_wr:.0%} vs baseline={baseline_wr:.0%}, n={asset_total})")
+            return modifier
+        except Exception as e:
+            print(f"  [CRYPTO TRADER] Asset modifier error: {e}")
+            return 1.0
+
+    def _get_analyst_overrides(self) -> Dict[str, Dict]:
+        """Read analyst overrides from agent_state table. Returns dict keyed by asset name (lowercased)."""
+        overrides = {}
+        try:
+            from archivist import Archivist
+            _arch = Archivist(self.db_path)
+            rows = _arch._fetchall(
+                "SELECT key, value FROM agent_state WHERE key LIKE 'analyst_override_%'"
+            )
+            for row in rows:
+                key, value = row
+                asset = key.replace("analyst_override_", "").lower()
+                try:
+                    data = json.loads(value)
+                    overrides[asset] = data
+                except json.JSONDecodeError:
+                    print(f"    [ANALYST] Bad JSON for override {key}")
+        except Exception as e:
+            print(f"    [ANALYST] Error reading overrides: {e}")
+        return overrides
+
+    def _apply_analyst_override(self, confidence: int, coin_id: str, side: str,
+                                 direction: str, title: str) -> int:
+        """Check for analyst overrides matching this asset. Returns adjusted confidence."""
+        overrides = self._get_analyst_overrides()
+        if not overrides:
+            return confidence
+
+        # Match asset name case-insensitively with partial matching
+        asset_names = [coin_id.lower(), title.lower()]
+        matched_key = None
+        matched_override = None
+
+        for override_asset, override_data in overrides.items():
+            for name in asset_names:
+                if override_asset in name or name in override_asset:
+                    matched_key = override_asset
+                    matched_override = override_data
+                    break
+            if matched_override:
+                break
+
+        if not matched_override:
+            return confidence
+
+        # Check expiry
+        expires = matched_override.get("expires", "")
+        if expires:
+            try:
+                exp_date = datetime.strptime(expires, "%Y-%m-%d")
+                if datetime.now() > exp_date:
+                    print(f"    [ANALYST] Override for \"{matched_key}\" expired {expires} — ignoring")
+                    return confidence
+            except ValueError:
+                pass
+
+        override_dir = matched_override.get("direction", "").lower()
+        boost = matched_override.get("confidence_boost", 0)
+        reason = matched_override.get("reason", "no reason given")
+
+        # Determine alignment:
+        # Bullish = price going up. Bearish = price going down.
+        # bet_is_bullish: YES on above, or NO on below
+        bet_is_bullish = (
+            (side == "yes" and direction == "above") or
+            (side == "no" and direction == "below")
+        )
+        bet_is_bearish = not bet_is_bullish
+
+        if override_dir == "bullish":
+            if bet_is_bullish:
+                adjustment = boost
+            else:
+                adjustment = -boost
+        elif override_dir == "bearish":
+            if bet_is_bearish:
+                adjustment = boost
+            else:
+                adjustment = -boost
+        else:
+            print(f"    [ANALYST] Unknown direction \"{override_dir}\" for {matched_key}")
+            return confidence
+
+        new_confidence = confidence + adjustment
+        align_str = "ALIGNED" if adjustment > 0 else "CONFLICTING"
+        print(f"    [ANALYST] Override for \"{matched_key}\": {override_dir} ({reason})")
+        print(f"    [ANALYST] {align_str} with {side.upper()} on {direction} — confidence {confidence} -> {new_confidence} ({adjustment:+d})")
+        return new_confidence
 
     def get_15min_momentum(self, coin_id):
         """Get short-term momentum from CoinGecko hourly data. Returns % change over last hour."""
@@ -88,7 +305,7 @@ class CryptoMarketScanner:
         try:
             url = f"{POLYMARKET_GAMMA_URL}/events"
 
-            for offset in range(0, 300, 100):
+            for offset in range(0, 600, 100):  # 6 pages — catches commodity markets deeper in results
                 params = {
                     'closed': 'false',
                     'limit': 100,
@@ -289,12 +506,43 @@ class CryptoMarketScanner:
 
         return None
 
-    def _detect_coin_in_text(self, text: str) -> Optional[str]:
-        """Detect which cryptocurrency a market is about."""
+    def _get_yahoo_price(self, symbol: str):
+        """Get price data from Yahoo Finance for commodities/equities."""
+        cache_key = f"change_yf:{symbol}"
+        if cache_key in self.price_cache:
+            cached_time, cached_data = self.price_cache[cache_key]
+            if (datetime.now() - cached_time).seconds < 120:
+                return cached_data
+        try:
+            url = f"https://query1.finance.yahoo.com/v8/finance/chart/{symbol}?interval=1d&range=7d"
+            headers = {"User-Agent": "Mozilla/5.0"}
+            resp = requests.get(url, headers=headers, timeout=10)
+            if resp.status_code == 200:
+                data = resp.json()
+                result_data = data["chart"]["result"][0]
+                meta = result_data["meta"]
+                price = meta.get("regularMarketPrice", 0)
+                prev = meta.get("chartPreviousClose", 0)
+                change_24h = ((price - prev) / prev * 100) if prev else 0
+                closes = result_data["indicators"]["quote"][0].get("close", [])
+                closes = [c for c in closes if c is not None]
+                change_7d = ((closes[-1] - closes[0]) / closes[0] * 100) if len(closes) >= 2 else 0
+                result = {"price": price, "change_24h": change_24h, "change_7d": change_7d}
+                self.price_cache[cache_key] = (datetime.now(), result)
+                return result
+        except Exception as e:
+            print(f"  [!] Yahoo Finance error ({symbol}): {e}")
+        return None
+
+    def _detect_coin_in_text(self, text: str):
+        """Detect which asset a market is about. Returns CoinGecko ID or yf:SYMBOL."""
         text_lower = text.lower()
         for keyword, cg_id in CRYPTO_COINGECKO_IDS.items():
-            if re.search(r'\b' + re.escape(keyword) + r'\b', text_lower):
+            if re.search(chr(92)+chr(98) + re.escape(keyword) + chr(92)+chr(98), text_lower):
                 return cg_id
+        for keyword, yf_sym in YAHOO_FINANCE_SYMBOLS.items():
+            if re.search(chr(92)+chr(98) + re.escape(keyword) + chr(92)+chr(98), text_lower):
+                return f"yf:{yf_sym}"
         return None
 
     def _parse_price_target(self, text: str) -> Optional[float]:
@@ -315,8 +563,18 @@ class CryptoMarketScanner:
         return None
 
     def _determine_direction(self, text: str) -> Optional[str]:
-        """Determine if market asks about price going UP or DOWN."""
+        """Determine if market asks about price going UP or DOWN.
+        Also classifies market format type as side effect."""
         text_lower = text.lower()
+
+        # Classify format type
+        self._last_format_type = 'unknown'
+        if any(w in text_lower for w in ['hit', 'reach', 'touch']):
+            self._last_format_type = 'touch'
+        elif any(w in text_lower for w in ['be above', 'be below', 'settle above', 'settle below', 'close above', 'close below']):
+            self._last_format_type = 'settlement'
+        elif re.search(r'\$[\d,.]+\s*[-\u2013]\s*\$[\d,.]+', text_lower):
+            self._last_format_type = 'range'
 
         down_words = ['dip to', 'dip below', 'drop to', 'drop below', 'fall to',
                        'fall below', 'crash', 'below', 'under', 'lower than',
@@ -326,6 +584,8 @@ class CryptoMarketScanner:
 
         for w in down_words:
             if w in text_lower:
+                if self._last_format_type == 'unknown':
+                    self._last_format_type = 'threshold_below'
                 return 'below'
         for w in up_words:
             if w in text_lower:
@@ -539,7 +799,7 @@ class CryptoMarketScanner:
                         ' ' + m.get('description', ''))
             cid = self._detect_coin_in_text(combined)
             if cid:
-                coin_ids.append(cid)
+                if not cid.startswith("yf:"): coin_ids.append(cid)
         if coin_ids:
             self._bulk_fetch_prices(coin_ids)
 
@@ -565,7 +825,29 @@ class CryptoMarketScanner:
             else:
                 rec['same_day'] = False
 
-        # Sort by composite score (with same-day priority applied)
+        # Commodity near-target boost: commodities close to price target get priority
+        # (early resolution = fast turnaround even on monthly markets)
+        COMMODITY_KEYWORDS = ['oil', 'crude', 'gold', 'silver', 'copper', 'platinum']
+        for rec in recommendations:
+            title_lower = rec.get('title', '').lower()
+            is_commodity = any(kw in title_lower for kw in COMMODITY_KEYWORDS)
+            if is_commodity:
+                days = rec.get('days_until', 30)
+                # Prefer shorter-dated commodity markets (March over June)
+                if days <= 25:
+                    rec['composite_score'] = rec.get('composite_score', 0) * 1.3
+                elif days <= 60:
+                    rec['composite_score'] = rec.get('composite_score', 0) * 1.15
+                # Extra boost if close to target (SNAP potential = fast resolution)
+                dist = abs(rec.get('distance_pct', 100))
+                if dist < 3:
+                    rec['composite_score'] = rec.get('composite_score', 0) * 1.4
+                    rec['commodity_snap'] = True
+                elif dist < 5:
+                    rec['composite_score'] = rec.get('composite_score', 0) * 1.2
+                    rec['commodity_snap'] = True
+
+        # Sort by composite score (with priority boosts applied)
         recommendations.sort(key=lambda x: x.get('composite_score', 0), reverse=True)
         return recommendations
 
@@ -586,9 +868,9 @@ class CryptoMarketScanner:
 
         coin_id = self._detect_coin_in_text(combined_text)
         if not coin_id:
-            return None
+            print(f"  [CRYPTO TRADER DBG] No asset detected: {title[:50]}"); return None
 
-        price_data = self._get_price_change(coin_id)
+        price_data = self._get_yahoo_price(coin_id[3:]) if coin_id.startswith("yf:") else self._get_price_change(coin_id)
         if not price_data or not price_data.get('price'):
             return None
 
@@ -732,13 +1014,52 @@ class CryptoMarketScanner:
         )
         betting_against_move = not betting_on_move
 
-        # Classify bet type
-        if betting_against_move:
+        # Classify bet type — understanding WHAT we're betting and WHY
+        #
+        # EARLY-RESOLUTION MARKETS (key insight):
+        #   Markets like "Will Oil hit $60 by March 31?" don't wait until Mar 31.
+        #   The MOMENT the price touches $60, it resolves YES instantly.
+        #   So a "23 day" market could resolve in hours on a big move.
+        #   The market prices it as a long bet, but we know it can pop anytime.
+        #
+        # Categories:
+        #   HOLD    = Price already past target. Just needs to not crash back.
+        #            E.g., BTC at $67K, "above $60K?" = YES is near-certain, hold the line.
+        #   FADE    = Betting price WON'T reach a far target. High win rate.
+        #            E.g., "Oil hit $130?" when oil is $90 = NO, that's a 44% pump in 23 days.
+        #   SNAP    = Price is close to target. One good move = instant resolution.
+        #            E.g., Oil at $90, "hit $100?" = just needs a 10% move, could be days.
+        #   LOTTO   = Price is far but cheap YES side has huge payout (10x+).
+        #            E.g., "ETH hit $3K?" at 0.3% = if it happens, massive return.
+        #   DECAY   = Short-dated market, price behavior is more predictable.
+        #            E.g., "BTC above $66K tomorrow?" when BTC is $67K = time is our friend.
+        #   MOMENTUM = Trend-following, price moving toward target with confirmation.
+
+        already_past = (
+            (direction == 'above' and distance_pct <= 0) or
+            (direction == 'below' and distance_pct >= 0)
+        )
+
+        # Format-aware probability adjustment (C2)
+        format_type = getattr(self, '_last_format_type', 'unknown')
+        if format_type == 'touch' and not already_past:
+            our_yes_estimate = min(0.95, our_yes_estimate * 1.15)
+            print(f"    [CRYPTO TRADER] Touch market boost: est={our_yes_estimate:.0%}")
+
+        if already_past and abs_dist > 3:
+            bet_type = "HOLD"
+        elif betting_against_move and abs_dist > 20:
             bet_type = "FADE"
-        elif buy_price < 0.15 and our_estimate > buy_price * 1.5:
-            bet_type = "COMPRESSION"  # Probability compression play
+        elif betting_against_move:
+            bet_type = "FADE"
+        elif not already_past and abs_dist < 12 and days_until > 2:
+            bet_type = "SNAP"  # Close to target, could resolve fast
+        elif buy_price < 0.10 and payout_mult >= 10:
+            bet_type = "LOTTO"
         elif days_until < 3:
-            bet_type = "DECAY"  # Time-decay squeeze
+            bet_type = "DECAY"
+        elif buy_price < 0.15 and our_estimate > buy_price * 1.5:
+            bet_type = "COMPRESSION"
         else:
             bet_type = "MOMENTUM"
 
@@ -804,8 +1125,15 @@ class CryptoMarketScanner:
         confidence = self._calculate_confidence(
             edge, momentum, distance_pct, direction, days_until,
             buy_price, betting_against_move, payout_mult,
-            checklist_score, signal_avg, aligned_signals
+            checklist_score, signal_avg, aligned_signals, bet_type
         )
+
+        # === ANALYST OVERRIDE ===
+        confidence = self._apply_analyst_override(confidence, coin_id, side, direction, title)
+
+        # === ASSET MODIFIER (data-driven) ===
+        asset_mod = self._get_asset_modifier(coin_id if not coin_id.startswith('yf:') else coin_id[3:])
+        confidence = max(0, min(100, int(confidence * asset_mod)))
 
         if confidence < min_conf:
             print(f"    [CRYPTO TRADER] confidence {confidence} < {min_conf}")
@@ -817,11 +1145,11 @@ class CryptoMarketScanner:
         base_bet = bet_min + (bet_max - bet_min) * (
             (confidence - min_conf) / conf_range
         )
-        # Moonshot sizing: cap at minimum for high-payout plays
+        # Longshot sizing: $5-$7 for high-payout plays
         if payout_mult > 10:
-            base_bet = bet_min
+            base_bet = 5.0 + min(2.0, (payout_mult - 10) * 0.1)  # $5-$7 for 10x+
         elif payout_mult > 5:
-            base_bet = min(base_bet, bet_min + 2)
+            base_bet = min(base_bet, 7.0)  # Cap at $7 for 5-10x
         bet_amount = max(bet_min, min(bet_max, base_bet))
 
         # Composite score for ranking (EV weighted by checklist + signals)
@@ -859,6 +1187,7 @@ class CryptoMarketScanner:
             'composite_score': composite_score,
             'payout_mult': payout_mult,
             'bet_type': bet_type,
+                'format_type': getattr(self, '_last_format_type', 'unknown'),
             'checklist_score': checklist_score,
             'checklist_items': checks,
             'signal_count': aligned_signals,
@@ -872,6 +1201,7 @@ class CryptoMarketScanner:
             'change_24h': change_24h,
             'change_7d': change_7d,
             'days_until': days_until,
+            'distance_pct': distance_pct,
         }
 
     # ------------------------------------------------------------------
@@ -1034,25 +1364,62 @@ class CryptoMarketScanner:
     def _calculate_confidence(self, edge, momentum, distance_pct, direction,
                                days_until, buy_price, betting_against_move,
                                payout_mult, checklist_score, signal_avg,
-                               aligned_signals) -> int:
+                               aligned_signals, bet_type="MOMENTUM") -> int:
         """
-        Multi-factor confidence scoring.
+        Multi-factor confidence scoring by bet type.
 
-        Three tracks with different starting points:
-        1. FADE (betting against extreme moves) - starts at 45
-        2. COMPRESSION (cheap + mispriced) - starts at 42
-        3. MOMENTUM (trend-following) - starts at 38
+        Each bet type has a different scoring track because the risk profile
+        and what makes a "good" bet differs for each:
 
-        Checklist and signal stack provide bonus points on top.
+        HOLD (starts 50)  - Price already past target. High base, penalize if close to edge.
+        FADE (starts 45)  - Betting against extreme move. Distance = safety.
+        SNAP (starts 40)  - Close to target, early resolution play. Momentum is king.
+        LOTTO (starts 30) - Cheap longshot. Low base, needs strong signals to qualify.
+        DECAY (starts 48) - Short-dated, price predictable. Time pressure = confidence.
+        COMPRESSION (starts 42) - Cheap + mispriced. Asymmetry bonus.
+        MOMENTUM (starts 38) - Trend-following. Needs strong confirmation.
         """
-        if betting_against_move:
+        abs_dist = abs(distance_pct)
+
+        if bet_type == "HOLD":
+            # Price already past target - we just need it to STAY
+            # High base because the hard part (reaching target) is done
+            score = 50
+
+            # How far past? More buffer = safer
+            if abs_dist > 15:
+                score += 12  # Way past, very safe
+            elif abs_dist > 10:
+                score += 8
+            elif abs_dist > 5:
+                score += 4
+            elif abs_dist < 2:
+                score -= 5  # Dangerously close to flipping back
+
+            # Edge bonus (0-12)
+            score += min(12, edge * 60)
+
+            # Counter-momentum penalty (price drifting back toward target)
+            if direction == 'above' and momentum < -1:
+                score -= min(10, abs(momentum) * 4)
+            elif direction == 'below' and momentum > 1:
+                score -= min(10, momentum * 4)
+
+            # Short time helps HOLDs - less chance of crash
+            if days_until < 2:
+                score += 5
+            elif days_until < 5:
+                score += 3
+
+        elif bet_type == "FADE":
+            # Betting price WON'T reach a far target
+            # Distance is our best friend - further = safer
             score = 45
 
             # Edge (0-15)
             score += min(15, edge * 80)
 
-            # Distance safety
-            abs_dist = abs(distance_pct)
+            # Distance safety - the core of a FADE
             if abs_dist > 30:
                 score += 12
             elif abs_dist > 20:
@@ -1060,26 +1427,112 @@ class CryptoMarketScanner:
             elif abs_dist > 15:
                 score += 4
 
-            # Counter-momentum helps fades
+            # Counter-momentum helps fades (price moving AWAY from target)
             if direction == 'above' and momentum < 0:
                 score += min(5, abs(momentum) * 2)
             elif direction == 'below' and momentum > 0:
                 score += min(5, momentum * 2)
 
-            # Time decay
+            # Short time = less chance target gets hit
             if days_until < 3:
                 score += 5
             elif days_until < 7:
                 score += 3
 
-        elif buy_price < 0.15:
-            # COMPRESSION track - cheap asymmetric plays
+        elif bet_type == "SNAP":
+            # Close to target - early resolution play
+            # The market prices this as a long bet but it could pop anytime
+            # Momentum toward target is critical
+            score = 40
+
+            # Edge (0-12)
+            score += min(12, edge * 60)
+
+            # Momentum toward target is THE key factor for SNAPs
+            if direction == 'above' and momentum > 0:
+                score += min(15, momentum * 5)  # Strong uptrend = snap incoming
+            elif direction == 'below' and momentum < 0:
+                score += min(15, abs(momentum) * 5)
+            elif abs(momentum) > 1:
+                score -= 6  # Moving away from target = bad for SNAP
+
+            # Closeness bonus - closer = higher chance of snap resolution
+            if abs_dist < 3:
+                score += 8  # Almost there
+            elif abs_dist < 6:
+                score += 5
+            elif abs_dist < 10:
+                score += 2
+
+            # More time = more chances for the snap to happen
+            if days_until > 14:
+                score += 4
+            elif days_until > 7:
+                score += 2
+
+        elif bet_type == "LOTTO":
+            # Cheap longshot - massive payout if it hits
+            # Low base because these are inherently risky
+            # Needs strong signals to overcome the low base
+            score = 30
+
+            # Edge matters a lot here - is the market REALLY mispriced?
+            score += min(15, edge * 100)
+
+            # Payout multiplier - bigger = more justified risk
+            if payout_mult >= 20:
+                score += 10
+            elif payout_mult >= 15:
+                score += 7
+            elif payout_mult >= 10:
+                score += 4
+
+            # Momentum toward target
+            if direction == 'above' and momentum > 2:
+                score += min(8, momentum * 3)
+            elif direction == 'below' and momentum < -2:
+                score += min(8, abs(momentum) * 3)
+
+            # More time = more lottery tickets
+            if days_until > 14:
+                score += 5
+            elif days_until > 7:
+                score += 3
+
+        elif bet_type == "DECAY":
+            # Short-dated, price behavior more predictable
+            # Higher base because less time = less uncertainty
+            score = 48
+
+            # Edge (0-12)
+            score += min(12, edge * 60)
+
+            # Very short time is ideal for decay plays
+            if days_until < 1:
+                score += 6
+            elif days_until < 2:
+                score += 3
+
+            # Current position relative to target
+            if abs_dist > 10:
+                score += 5  # Far from target with little time = safe NO
+            elif abs_dist < 3:
+                score += 3  # Very close with little time = safe YES
+
+            # Momentum alignment
+            if direction == 'above' and momentum > 0:
+                score += min(6, momentum * 2)
+            elif direction == 'below' and momentum < 0:
+                score += min(6, abs(momentum) * 2)
+
+        elif bet_type == "COMPRESSION":
+            # Cheap + mispriced - asymmetric risk/reward
             score = 42
 
             # Edge (0-15)
             score += min(15, edge * 80)
 
-            # Asymmetry bonus (capped: was +15/+12/+8, now +8/+6/+4)
+            # Asymmetry bonus - cheaper = better R/R
             if buy_price < 0.06:
                 score += 8
             elif buy_price < 0.10:
@@ -1094,19 +1547,19 @@ class CryptoMarketScanner:
                 score += min(8, abs(momentum) * 3)
 
         else:
-            # MOMENTUM track - more expensive plays need more confirmation
+            # MOMENTUM - trend-following, needs strong confirmation
             score = 38
 
             # Edge (0-15)
             score += min(15, edge * 80)
 
-            # Momentum alignment (critical for this track)
+            # Momentum alignment is critical
             if direction == 'above' and momentum > 0:
                 score += min(12, momentum * 4)
             elif direction == 'below' and momentum < 0:
                 score += min(12, abs(momentum) * 4)
             elif abs(momentum) > 1:
-                score -= 8  # Counter-momentum penalty
+                score -= 8  # Counter-momentum = bad
 
             # Asymmetry
             if buy_price < 0.25:
@@ -1114,7 +1567,7 @@ class CryptoMarketScanner:
             elif buy_price < 0.35:
                 score += 2
 
-        # === UNIVERSAL BONUSES ===
+        # === UNIVERSAL BONUSES (apply to all bet types) ===
 
         # Checklist bonus (0-8 points)
         score += min(8, checklist_score * 2)
@@ -1127,7 +1580,11 @@ class CryptoMarketScanner:
         elif aligned_signals >= 3:
             score += 2
 
-        return max(0, min(100, int(score)))
+        # === DYNAMIC MODIFIERS (data-driven, from DB) ===
+        hour_mod = self._get_hour_modifier().get(current_hour_et(), 1.0)
+        score = int(score * hour_mod)
+
+        return max(0, min(100, score))
 
 
 # ------------------------------------------------------------------

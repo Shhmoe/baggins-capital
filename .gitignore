@@ -14,7 +14,6 @@ node_modules/
 # Environment & secrets
 .env
 .env.*
-!.env.example
 
 # Databases & logs
 *.db
@@ -38,3 +37,18 @@ Thumbs.db
 # IDE
 .vscode/
 .idea/
+*.bak[0-9]*
+*.backup.*
+*.db-shm
+weather_upgrade.py
+three_builds.py
+
+# Patch scripts (one-time deployment tools)
+patch_*.py
+
+# Pause flags (runtime state)
+.pause_*
+
+# Retired modules
+*.retired
+backups/

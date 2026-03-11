@@ -331,9 +331,9 @@ class Bankr:
 
             # Log to portfolio_checks table so other employees can access
             try:
-                import sqlite3 as _sql
-                _conn = _sql.connect(self.db_path, timeout=30)
-                _conn.execute(
+                from archivist import Archivist
+                _arch = Archivist(self.db_path)
+                _arch._execute(
                     "CREATE TABLE IF NOT EXISTS portfolio_checks ("
                     "id INTEGER PRIMARY KEY AUTOINCREMENT, "
                     "checked_at TEXT NOT NULL, "
@@ -342,13 +342,12 @@ class Bankr:
                     "pending_count INTEGER, "
                     "resolved_count INTEGER DEFAULT 0)"
                 )
-                _conn.execute(
+                _arch._execute(
                     "INSERT INTO portfolio_checks (checked_at, redeem_response, pending_count) "
                     "VALUES (?, ?, ?)",
-                    (now.isoformat(), bulk_resp[:5000] if bulk_resp else None, len(self.get_pending_bets()))
+                    (now.isoformat(), bulk_resp[:5000] if bulk_resp else None, len(self.get_pending_bets())),
+                    commit=True
                 )
-                _conn.commit()
-                _conn.close()
             except Exception as e:
                 print(f"  [SETTLEMENT CLERK] DB log error: {e}")
 
@@ -425,6 +424,19 @@ class Bankr:
         print(f"  [SETTLEMENT CLERK] {len(redeemable)} redeemable position(s)")
 
         resolved = []
+
+        # Resolve expired 'Not found' bets as confirmed losses
+        found_ids = set(b['id'] for b in redeemable)
+        for bet in bets_to_check:
+            if bet['id'] in found_ids:
+                continue
+            nearby = self._find_bet_in_response(bet, response)
+            if nearby and 'not found' in nearby and self._is_market_past_date(bet):
+                print(f"  [SETTLEMENT CLERK] #{bet['id']}: Not found in wallet. Resolving as loss.")
+                self._resolve_bet(bet['id'], won=False, profit=-bet['amount'],
+                                  source='bankr_confirmed_loss', redeemed_amount=0.0)
+                resolved.append({'bet_id': bet['id'], 'won': False, 'profit': -bet['amount']})
+
         for bet in redeemable:
             r = self._redeem_position(bet)
             if r:
@@ -524,8 +536,10 @@ class Bankr:
         result = self._run_prompt(
             f"Redeem my {side} position on Polymarket: \"{title}\"\n"
             f"I bet ${amount:.2f} at {odds:.2f} odds on {side}.\n"
-            f"Please redeem and tell me the EXACT USDC amount returned to my wallet.\n"
-            f"Only report the actual USDC received, not the number of shares or position value."
+            f"Execute the redemption now. Reply with ONLY:\n"
+            f"- The USDC amount returned (e.g. \"returned $2.50 USDC\")\n"
+            f"- Or \"returned $0 USDC\" if the position lost\n"
+            f"Do NOT mention wallet balance, POL, gas fees, or ask questions."
         )
 
         if not result.get('success'):
@@ -606,6 +620,9 @@ class Bankr:
         loss_patterns = [
             r'(?:lost|loss|expired|worthless|no\s+(?:payout|return)).*?\$?0(?:\.0+)?\s*(?:USDC)?',
             r'\$0(?:\.0+)?\s*(?:USDC)?\s*(?:return|paid|back)',
+            r'(?:worth|resolved\s+to|currently\s+worth)\s*\*{0,2}\$?0(?:\.0+)?\s*\*{0,2}\s*(?:USDC)?',
+            r'position.*?\$0(?:\.0+)?',
+            r'0\s*USDC.*?(?:worth|value)',
         ]
         for pattern in loss_patterns:
             if re.search(pattern, resp_lower):
@@ -619,7 +636,9 @@ class Bankr:
             end = min(len(resp), m.end() + 40)
             context = resp[start:end].lower()
             reject_words = ['shares', 'position', 'worth', 'value', 'price',
-                           'market', 'contract', 'stake', 'bet of', 'wagered']
+                           'market', 'contract', 'stake', 'bet of', 'wagered',
+                           'wallet', 'balance', 'you have', 'hold', 'polygon',
+                           'gas', 'swap', 'cover', 'fees', 'currently has']
             if not any(rw in context for rw in reject_words):
                 if val < bet_amount * 200:
                     return val
@@ -872,9 +891,9 @@ class Bankr:
 
     def _ensure_tables(self):
         """Create resolution tracking tables."""
-        conn = sqlite3.connect(self.db_path, timeout=30)
-        c = conn.cursor()
-        c.execute("""
+        from archivist import Archivist
+        _arch = Archivist(self.db_path)
+        _arch._execute("""
             CREATE TABLE IF NOT EXISTS bet_resolutions (
                 id INTEGER PRIMARY KEY AUTOINCREMENT,
                 bet_id INTEGER NOT NULL,
@@ -888,11 +907,11 @@ class Bankr:
             )
         """)
         try:
-            c.execute("ALTER TABLE bets ADD COLUMN resolved_by TEXT DEFAULT NULL")
+            _arch._execute("ALTER TABLE bets ADD COLUMN resolved_by TEXT DEFAULT NULL")
         except Exception:
             pass
-        conn.commit()
-        conn.close()
+        _arch._commit()
+        
 
     def _resolve_bet(self, bet_id, won, profit, source='bankr_redeem',
                      redeemed_amount=None, actual_data=None):
@@ -900,16 +919,16 @@ class Bankr:
 
         If redeemed_amount provided, it overrides won/profit calculation.
         """
-        conn = sqlite3.connect(self.db_path, timeout=30)
-        conn.row_factory = sqlite3.Row
+        from archivist import Archivist
+        _arch = Archivist(self.db_path)
+        _conn = _arch._conn()
+        _conn.row_factory = sqlite3.Row
 
-        bet = conn.execute("SELECT * FROM bets WHERE id = ?", (bet_id,)).fetchone()
+        bet = _conn.execute("SELECT * FROM bets WHERE id = ?", (bet_id,)).fetchone()
         if not bet:
-            conn.close()
             return
 
         if bet['status'] == 'resolved' and source != 'weather_data':
-            conn.close()
             return
 
         now = datetime.now(timezone.utc).isoformat()
@@ -925,14 +944,14 @@ class Bankr:
             except Exception:
                 pass
 
-        conn.execute("""
+        _conn.execute("""
             UPDATE bets SET status = 'resolved', resolved_at = ?,
                 won = ?, profit = ?, resolved_by = ?,
                 balance_before = NULL, balance_after = ?
             WHERE id = ? AND status = 'pending'
         """, (now, int(won), profit, source, balance_after, bet_id))
 
-        conn.execute("""
+        _conn.execute("""
             INSERT INTO bet_resolutions
                 (bet_id, resolved_at, resolved_by, won, profit,
                  redeemed_amount, actual_data)
@@ -941,8 +960,7 @@ class Bankr:
               redeemed_amount,
               json.dumps(actual_data) if actual_data else None))
 
-        conn.commit()
-        conn.close()
+        _arch._commit()
 
         # Release wallet funds
         if self.wallet:
@@ -980,15 +998,16 @@ class Bankr:
         """Get all pending bets from DB."""
         if not self.db_path:
             return []
-        conn = sqlite3.connect(self.db_path, timeout=30)
-        conn.row_factory = sqlite3.Row
-        rows = conn.execute("""
+        from archivist import Archivist
+        _arch = Archivist(self.db_path)
+        _conn = _arch._conn()
+        _conn.row_factory = sqlite3.Row
+        rows = _conn.execute("""
             SELECT id, market_title, category, cycle_type, side,
                    amount, odds, timestamp
             FROM bets WHERE status = 'pending'
             ORDER BY id ASC
         """).fetchall()
-        conn.close()
         return [dict(r) for r in rows]
 
     def _log_audit(self, source, resolved, response_raw):
@@ -996,8 +1015,9 @@ class Bankr:
         if not self.db_path:
             return
         now_str = datetime.now(timezone.utc).isoformat()
-        conn = sqlite3.connect(self.db_path, timeout=30)
-        conn.execute("""
+        from archivist import Archivist
+        _arch = Archivist(self.db_path)
+        _arch._execute("""
             INSERT INTO bet_resolutions
                 (bet_id, resolved_at, resolved_by, won, profit,
                  redeemed_amount, actual_data)
@@ -1009,8 +1029,7 @@ class Bankr:
                   'matched': len(resolved),
                   'response': response_raw[:2000]
               })))
-        conn.commit()
-        conn.close()
+        _arch._commit()
 
     # ==================================================================
     # Simulation (dry run)

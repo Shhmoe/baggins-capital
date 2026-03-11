@@ -29,6 +29,7 @@ import math
 import time
 import requests
 import sqlite3
+from company_clock import current_hour_et, in_window as clock_in_window, status as clock_status
 from datetime import datetime, timedelta
 from dotenv import load_dotenv
 
@@ -89,25 +90,38 @@ class WeatherScanner:
     GAMMA_URL = POLYMARKET_GAMMA_URL + "/events"
     KEYWORDS = ["highest temperature", "temperature", "temp", "weather forecast", "high temp", "low temp", "degrees"]
 
-    def scan_weather_markets(self):
+    def scan_weather_markets(self, pre_fetched_events=None):
         """Find open temperature prediction markets on Polymarket.
         Returns flat list of sub-market dicts.
         Filters: skip same-day markets (<6h), skip expired markets.
+
+        If pre_fetched_events is provided (from Market Scout), skips Gamma API fetch.
         """
         all_markets = []
         try:
-            for offset in range(0, 200, 50):
-                url = f"{self.GAMMA_URL}?closed=false&limit=50&offset={offset}&tag_id=84"
-                resp = requests.get(url, timeout=15)
-                if resp.status_code != 200:
-                    print(f"[WEATHER ANALYST] Gamma API error: {resp.status_code}")
-                    break
+            if pre_fetched_events is not None:
+                # Use Scout's pre-fetched events — no Gamma API call needed
+                all_events = pre_fetched_events
+                print(f"[WEATHER ANALYST] Using {len(all_events)} pre-fetched events from Scout")
+            else:
+                # Fallback: fetch from Gamma API directly
+                all_events = []
+                for offset in range(0, 200, 50):
+                    url = f"{self.GAMMA_URL}?closed=false&limit=50&offset={offset}&tag_id=84"
+                    resp = requests.get(url, timeout=15)
+                    if resp.status_code != 200:
+                        print(f"[WEATHER ANALYST] Gamma API error: {resp.status_code}")
+                        break
 
-                events = resp.json()
-                if not events:
-                    break
+                    page_events = resp.json()
+                    if not page_events:
+                        break
+                    all_events.extend(page_events)
 
-                for event in events:
+                if not all_events:
+                    return all_markets
+
+            for event in all_events:
                     title = event.get("title", "")
                     title_lower = title.lower()
 
@@ -296,11 +310,10 @@ class HistoricalBaseline:
             return
 
         try:
-            conn = sqlite3.connect(self.db_path)
-            c = conn.cursor()
-            c.execute("SELECT COUNT(*) FROM historical_temperatures")
-            count = c.fetchone()[0]
-            conn.close()
+            from archivist import Archivist
+            _arch = Archivist(self.db_path)
+            row = _arch._fetchone("SELECT COUNT(*) FROM historical_temperatures")
+            count = row[0] if row else 0
             if count >= 100:
                 self._loaded = True
                 print(f"[HISTORIAN] Already have {count} records in DB")
@@ -317,10 +330,10 @@ class HistoricalBaseline:
         end_date = datetime.now().date() - timedelta(days=2)
         start_date = end_date - timedelta(days=730)
 
-        conn = sqlite3.connect(self.db_path)
-        c = conn.cursor()
+        from archivist import Archivist
+        _arch = Archivist(self.db_path)
 
-        c.execute("""
+        _arch._execute("""
             CREATE TABLE IF NOT EXISTS historical_temperatures (
                 city TEXT NOT NULL,
                 month INTEGER NOT NULL,
@@ -331,8 +344,7 @@ class HistoricalBaseline:
                 data_points INTEGER NOT NULL,
                 PRIMARY KEY (city, month)
             )
-        """)
-        conn.commit()
+        """, commit=True)
 
         cities_done = 0
         seen_coords = set()
@@ -389,7 +401,7 @@ class HistoricalBaseline:
                     mean_l = sum(vals["lows"]) / len(vals["lows"]) if vals["lows"] else mean_h - 15
                     std_l = (sum((x - mean_l) ** 2 for x in vals["lows"]) / len(vals["lows"])) ** 0.5 if len(vals["lows"]) > 1 else std_h
 
-                    c.execute("""
+                    _arch._execute("""
                         INSERT INTO historical_temperatures (city, month, mean_high, std_high, mean_low, std_low, data_points)
                         VALUES (?, ?, ?, ?, ?, ?, ?)
                         ON CONFLICT(city, month) DO UPDATE SET
@@ -399,7 +411,7 @@ class HistoricalBaseline:
 
                 cities_done += 1
                 if cities_done % 5 == 0:
-                    conn.commit()
+                    _arch._commit()
                     print(f"  [HISTORIAN] {cities_done}/{len(unique_cities)} cities loaded")
 
                 time.sleep(1.5)
@@ -408,21 +420,18 @@ class HistoricalBaseline:
                 print(f"  [ERROR] {city}: {e}")
                 time.sleep(1)
 
-        conn.commit()
-        conn.close()
+        _arch._commit()
         print(f"[HISTORIAN] Bootstrap complete: {cities_done} cities loaded")
 
     def get_stats(self, city, month):
         """Get historical mean + std for a city/month."""
         try:
-            conn = sqlite3.connect(self.db_path)
-            c = conn.cursor()
-            c.execute(
+            from archivist import Archivist
+            _arch = Archivist(self.db_path)
+            row = _arch._fetchone(
                 "SELECT mean_high, std_high FROM historical_temperatures WHERE city = ? AND month = ?",
                 (city, month)
             )
-            row = c.fetchone()
-            conn.close()
             if row:
                 return row[0], row[1]
         except Exception:
@@ -856,37 +865,132 @@ class CredibilityEngine:
         self.db_path = db_path
         self.historical = HistoricalBaseline(db_path)
 
-    def get_source_weight(self, city, source_name):
-        """Get credibility weight for a source in a specific city. Default 1.0."""
+    def get_source_weight(self, city, source_name, target_month=None):
+        """Get credibility weight for a source, using recency-weighted prediction history.
+        v7.0: Seasonal awareness — weights source accuracy for this time of year.
+        Falls back to static weather_sources.credibility_weight if <3 predictions exist."""
         try:
-            conn = sqlite3.connect(self.db_path)
-            c = conn.cursor()
-            c.execute(
+            from archivist import Archivist
+            _arch = Archivist(self.db_path)
+
+            # v7.0: Try seasonal data first (same month ±1, min 3 predictions)
+            seasonal_weight = None
+            if target_month is not None:
+                adj_months = [(target_month - 1) if target_month > 1 else 12,
+                              target_month,
+                              (target_month + 1) if target_month < 12 else 1]
+                month_strs = [f'%%-{m:02d}-%%' for m in adj_months]
+                seasonal_rows = _arch._fetchall("""
+                    SELECT error FROM source_prediction_log
+                    WHERE city = ? AND source_name = ?
+                    AND (market_date LIKE ? OR market_date LIKE ? OR market_date LIKE ?)
+                    ORDER BY logged_at DESC LIMIT 20
+                """, (city, source_name, month_strs[0], month_strs[1], month_strs[2]))
+
+                if len(seasonal_rows) >= 3:
+                    weighted_error_sum = 0.0
+                    weight_sum = 0.0
+                    for i, (error,) in enumerate(seasonal_rows):
+                        w = 0.9 ** i
+                        weighted_error_sum += error * w
+                        weight_sum += w
+                    seasonal_avg = weighted_error_sum / weight_sum if weight_sum > 0 else 3.0
+                    seasonal_weight = self._error_to_weight(seasonal_avg)
+                    print(f"  [SEASONAL] {source_name}@{city} month {target_month}: {len(seasonal_rows)} seasonal preds, avg_err={seasonal_avg:.1f}F, weight={seasonal_weight:.1f}")
+
+            # All-time recency-weighted (last 30 predictions)
+            rows = _arch._fetchall("""
+                SELECT error FROM source_prediction_log
+                WHERE city = ? AND source_name = ?
+                ORDER BY logged_at DESC LIMIT 30
+            """, (city, source_name))
+
+            if len(rows) >= 3:
+                weighted_error_sum = 0.0
+                weight_sum = 0.0
+                for i, (error,) in enumerate(rows):
+                    w = 0.9 ** i
+                    weighted_error_sum += error * w
+                    weight_sum += w
+                recency_avg_error = weighted_error_sum / weight_sum if weight_sum > 0 else 3.0
+                alltime_weight = self._error_to_weight(recency_avg_error)
+
+                # v7.0: Blend seasonal + alltime (seasonal gets 60% if available)
+                if seasonal_weight is not None:
+                    weight = seasonal_weight * 0.6 + alltime_weight * 0.4
+                else:
+                    weight = alltime_weight
+                return weight
+
+            # Fallback to static credibility_weight
+            row = _arch._fetchone(
                 "SELECT credibility_weight FROM weather_sources WHERE city = ? AND source_name = ?",
                 (city, source_name)
             )
-            row = c.fetchone()
-            conn.close()
             return row[0] if row else 1.0
         except Exception:
             return 1.0
 
+    def _error_to_weight(self, avg_error):
+        """Map average error to credibility weight (0.3-1.8 range)."""
+        if avg_error <= 0.5:
+            return 1.8
+        elif avg_error <= 1.0:
+            return 1.5
+        elif avg_error <= 1.5:
+            return 1.3
+        elif avg_error <= 2.0:
+            return 1.1
+        elif avg_error <= 3.0:
+            return 0.9
+        elif avg_error <= 4.0:
+            return 0.6
+        else:
+            return 0.3
+
     def get_weighted_forecast(self, city, forecasts):
-        """Compute weighted average high temp from multiple forecast sources."""
+        """Compute weighted average high temp from multiple forecast sources.
+        Returns (weighted_mean, spread, weights_used, std_dev, agreement_ratio)."""
         if not forecasts:
-            return None, None, {}
+            return None, None, {}, 0.0, 0.0
 
         weights_used = {}
         weighted_sum = 0.0
         total_weight = 0.0
         temps = []
 
+        # v7.0: Determine target month for seasonal source ranking
+        _target_month = None
+        for f in forecasts:
+            md = f.get("market_date") or f.get("target_date")
+            if md:
+                try:
+                    _target_month = int(str(md).split('-')[1])
+                except Exception:
+                    pass
+                break
+
         for f in forecasts:
             source = f["source"]
             high = f["high_temp"]
             if f.get("unit") == "C":
                 high = high * 9.0 / 5.0 + 32.0
-            w = self.get_source_weight(city, source)
+            w = self.get_source_weight(city, source, target_month=_target_month)
+
+            # v7.0: Forecast stability multiplier from snapshot drift
+            drift = f.get("snapshot_drift")
+            if drift is not None:
+                if drift > 5.0:
+                    stability_mult = 0.7   # Source is panicking — big forecast swings
+                elif drift > 3.0:
+                    stability_mult = 0.85  # Unstable
+                elif drift <= 1.0:
+                    stability_mult = 1.05  # Very stable — slight boost
+                else:
+                    stability_mult = 1.0   # Normal
+                w *= stability_mult
+                if stability_mult != 1.0:
+                    print(f"  [STABILITY] {source}@{city}: drift={drift:.1f}F, weight {w/stability_mult:.2f} -> {w:.2f}")
 
             # Phase 3: Bias correction (only after 10+ data points per source+city)
             bias = self._get_source_bias(city, source)
@@ -901,28 +1005,32 @@ class CredibilityEngine:
             temps.append(high)
 
         if total_weight == 0:
-            return None, None, {}
+            return None, None, {}, 0.0, 0.0
 
         weighted_mean = weighted_sum / total_weight
         spread = max(temps) - min(temps) if len(temps) > 1 else 0.0
 
-        return weighted_mean, spread, weights_used
+        # Source agreement metrics (B2)
+        if len(temps) >= 2:
+            variance = sum((t - weighted_mean) ** 2 for t in temps) / len(temps)
+            std_dev = variance ** 0.5
+            within_2f = sum(1 for t in temps if abs(t - weighted_mean) <= 2.0)
+            agreement_ratio = within_2f / len(temps)
+        else:
+            std_dev = 0.0
+            agreement_ratio = 1.0
 
-    def compute_probability(self, weighted_mean, spread, temp_range, city=None, target_date=None):
+        print(f"  [AGREEMENT] {city}: std_dev={std_dev:.1f}F, agreement={agreement_ratio:.0%} ({sum(1 for t in temps if abs(t - weighted_mean) <= 2.0)}/{len(temps)} within 2F)")
+
+        return weighted_mean, spread, weights_used, std_dev, agreement_ratio
+
+    def compute_probability(self, weighted_mean, spread, temp_range, city=None, target_date=None, std_dev=0.0):
         """Compute probability that actual temp falls in the given range.
         v2.0: Uses historical std as sigma floor for real weather variance.
         """
-        # v4.0: Sigma based on forecast agreement
-        # When sources agree closely (spread <= 1F), tighter sigma = more confident
-        # When spread is large, wider sigma = less confident
-        if spread <= 1.0:
-            sigma = 1.8  # Sources agree tightly — confident in forecast
-        elif spread <= 2.0:
-            sigma = 2.2  # Moderate agreement
-        elif spread <= 3.0:
-            sigma = 2.8  # Some disagreement
-        else:
-            sigma = max(3.0, spread / 2.0)  # Wide disagreement — low confidence
+        # v6.0: Data-driven sigma from source agreement (B2)
+        # Uses std_dev directly instead of hardcoded spread tiers
+        sigma = max(1.8, std_dev * 1.2) if std_dev > 0 else 2.5
 
         # v2.0: Historical baseline sigma integration
         if city and target_date:
@@ -983,13 +1091,12 @@ class CredibilityEngine:
             delta = -0.05
 
         try:
-            conn = sqlite3.connect(self.db_path)
-            c = conn.cursor()
+            from archivist import Archivist
+            _arch = Archivist(self.db_path)
 
             # Fetch existing row for EMA bias calculation
-            c.execute("SELECT avg_bias, consecutive_same_direction, avg_error, bias_consistency FROM weather_sources WHERE city = ? AND source_name = ?",
+            existing = _arch._fetchone("SELECT avg_bias, consecutive_same_direction, avg_error, bias_consistency FROM weather_sources WHERE city = ? AND source_name = ?",
                       (city, source_name))
-            existing = c.fetchone()
             old_bias = existing[0] if existing and existing[0] is not None else 0.0
             consec = existing[1] if existing else 0
             old_avg_error = existing[2] if existing else 0.0
@@ -1014,7 +1121,7 @@ class CredibilityEngine:
 
             bias_dir = "high" if new_bias > 0.5 else ("low" if new_bias < -0.5 else "neutral")
 
-            c.execute("""
+            _arch._execute("""
                 INSERT INTO weather_sources (city, source_name, credibility_weight, total_predictions, accurate_predictions, avg_error, last_updated, last_error_direction, consecutive_same_direction, avg_bias, bias_direction, bias_consistency)
                 VALUES (?, ?, ?, 1, ?, ?, ?, ?, ?, ?, ?, ?)
                 ON CONFLICT(city, source_name) DO UPDATE SET
@@ -1055,27 +1162,24 @@ class CredibilityEngine:
 
             # Inverse value floor: ensure consistently biased sources keep usable weight
             if consec >= 5 and old_avg_error > 3.0:
-                c.execute("""
+                _arch._execute("""
                     UPDATE weather_sources SET credibility_weight = MAX(credibility_weight, 0.6)
                     WHERE city = ? AND source_name = ?
                 """, (city, source_name))
 
-            conn.commit()
+            _arch._commit()
 
             # Log per-source prediction to source_prediction_log
             if bet_id is not None:
                 try:
-                    c.execute("""
+                    _arch._execute("""
                         INSERT INTO source_prediction_log
                             (bet_id, city, source_name, predicted_high, actual_high, error, bias, logged_at, market_date)
                         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
                     """, (bet_id, city, source_name, predicted_high, actual_high, error, signed_error,
-                          datetime.now().strftime('%Y-%m-%d %H:%M:%S'), market_date))
-                    conn.commit()
+                          datetime.now().strftime('%Y-%m-%d %H:%M:%S'), market_date), commit=True)
                 except Exception as spl_err:
                     print(f"  [!] source_prediction_log error: {spl_err}")
-
-            conn.close()
 
             consistency_label = "steady" if new_consistency < 1.5 else ("moderate" if new_consistency < 3.0 else "erratic")
             print(f"[AUDITOR] {source_name}@{city}: error={error:.1f}F ({direction}), delta={effective_delta:+.3f}, bias={new_bias:+.1f}F ({bias_dir}), consistency={new_consistency:.1f} ({consistency_label})")
@@ -1094,15 +1198,13 @@ class CredibilityEngine:
         A source always +3.1F warmer is GOLD after correction.
         """
         try:
-            conn = sqlite3.connect(self.db_path, timeout=30)
-            c = conn.cursor()
-            c.execute(
+            from archivist import Archivist
+            _arch = Archivist(self.db_path)
+            row = _arch._fetchone(
                 "SELECT avg_bias, total_predictions, consecutive_same_direction "
                 "FROM weather_sources WHERE city = ? AND source_name = ?",
                 (city, source_name)
             )
-            row = c.fetchone()
-            conn.close()
             if not row or row[0] is None:
                 return 0.0
             avg_bias, n, consec = row[0], row[1], row[2] or 0
@@ -1160,7 +1262,7 @@ class EdgeCalculator:
         # Also check for Fahrenheit — US markets use F, international use C
         return False
 
-    def evaluate(self, market, our_prob, spread, source_count, weights_used, weighted_mean):
+    def evaluate(self, market, our_prob, spread, source_count, weights_used, weighted_mean, agreement_ratio=0.5):
         """Evaluate a single sub-market for edge and confidence.
         v3.0: International filter, recalibrated edge/confidence scoring.
         """
@@ -1285,28 +1387,13 @@ class EdgeCalculator:
         is_conviction = False
         is_forecast_driven = forecast_in_range or forecast_near_range
 
-        # --- International city block ---
-        if city.lower() in self.INTERNATIONAL_BLOCKED:
-            print(f" -> BLOCKED [INTERNATIONAL] {city} - no NOAA, poor WR")
-            return None
-
-        # --- DB INTELLIGENCE: Check city+side historical performance ---
+        # --- Dynamic city confidence floor (B3: replaces static blocks + WR gates) ---
+        city_floor = self._get_dynamic_confidence_floor(city)
         city_total, city_wins, city_wr = self._get_city_record(city)
         side_total, side_wins, side_wr, side_profit = self._get_city_side_record(city, side)
 
-        # Block: city with 0% WR and 2+ resolved bets (proven loser)
-        if city_total >= 2 and city_wr == 0.0:
-            print(f" -> BLOCKED [CITY 0% WR] {city}: {city_total} bets, 0 wins")
-            return None
-
-        # Block: city+side combo with 0% WR and 2+ bets
-        if side_total >= 2 and side_wr == 0.0:
-            print(f" -> BLOCKED [{side.upper()} 0% WR] {city}/{side}: {side_total} bets, 0 wins")
-            return None
-
-        # Warn: city with <30% WR and 3+ bets (struggling)
-        if city_total >= 3 and city_wr < 0.30:
-            print(f" -> BLOCKED [CITY LOW WR] {city}: {city_wr:.0%} WR ({city_wins}W/{city_total})")
+        if city_floor > 100:
+            print(f" -> BLOCKED [DYNAMIC FLOOR={city_floor}] {city}: WR={city_wr:.0%} ({city_wins}W/{city_total})")
             return None
 
         # v4.2: Forecast-driven bets skip edge gate entirely
@@ -1331,16 +1418,12 @@ class EdgeCalculator:
         if is_threshold:
             confidence += 15  # Threshold markets have 60% WR
 
-        if spread <= 1:
-            confidence += 15
-        elif spread <= 2:
-            confidence += 12
-        elif spread <= 3:
-            confidence += 8
-        elif spread <= 4:
-            confidence += 3
-        else:
-            confidence -= 10
+        # Agreement-ratio-based confidence (B2: replaces spread tiers)
+        confidence += int((agreement_ratio - 0.5) * 30)
+
+        # v7.0: Agreement history WR — "When sources agreed like this, what was our WR?"
+        agreement_wr_adj = self._get_agreement_history_adjustment(agreement_ratio)
+        confidence += agreement_wr_adj
 
         # v2.0: More granular source count bonus
         if source_count >= 5:
@@ -1399,7 +1482,8 @@ class EdgeCalculator:
 
         confidence = max(0, min(100, confidence))
 
-        if confidence < WEATHER_MIN_CONFIDENCE:
+        if confidence < city_floor:
+            print(f"  [FLOOR] {city} confidence {confidence} < floor {city_floor}")
             return None
 
         return {
@@ -1426,12 +1510,12 @@ class EdgeCalculator:
     def _get_city_side_record(self, city, side):
         """Query DB for this city+side win rate. Returns (total, wins, wr, profit)."""
         try:
-            conn = sqlite3.connect(self.db_path, timeout=30)
-            row = conn.execute(
+            from archivist import Archivist
+            _arch = Archivist(self.db_path)
+            row = _arch._fetchone(
                 "SELECT total_bets, wins, win_rate, total_profit FROM weather_side_patterns WHERE city = ? AND side = ?",
                 (city.lower(), side.lower())
-            ).fetchone()
-            conn.close()
+            )
             if row:
                 return row[0], row[1], row[2], row[3]
         except Exception:
@@ -1441,12 +1525,12 @@ class EdgeCalculator:
     def _get_city_record(self, city):
         """Query DB for this city overall win rate. Returns (total, wins, wr)."""
         try:
-            conn = sqlite3.connect(self.db_path, timeout=30)
-            row = conn.execute(
+            from archivist import Archivist
+            _arch = Archivist(self.db_path)
+            row = _arch._fetchone(
                 "SELECT total_bets, wins, win_rate FROM weather_city_patterns WHERE city = ?",
                 (city.lower(),)
-            ).fetchone()
-            conn.close()
+            )
             if row:
                 return row[0], row[1], row[2]
         except Exception:
@@ -1531,6 +1615,41 @@ class EdgeCalculator:
 
         return score
 
+    def _get_dynamic_confidence_floor(self, city):
+        """Dynamic confidence floor based on city win rate and source coverage.
+        Replaces static INTERNATIONAL_BLOCKED and hardcoded city WR gates."""
+        floor = WEATHER_MIN_CONFIDENCE  # 85 base
+        try:
+            from archivist import Archivist
+            _arch = Archivist(self.db_path)
+            # City win rate
+            city_row = _arch._fetchone("SELECT total_bets, wins, win_rate FROM weather_city_patterns WHERE city = ?",
+                      (city.lower(),))
+            # Source count for this city
+            source_row = _arch._fetchone("SELECT COUNT(DISTINCT source_name) FROM weather_sources WHERE city = ?",
+                      (city.lower(),))
+
+            city_total = city_row[0] if city_row else 0
+            city_wr = city_row[2] if city_row else 0.0
+            source_count = source_row[0] if source_row else 0
+
+            if city_total >= 5:
+                if city_wr < 0.20:
+                    # Bad city: raise floor toward blocking (0% WR → floor 105)
+                    floor += int((0.50 - city_wr) * 40)
+                elif city_wr >= 0.50:
+                    # Good city: lower floor for easier entry (60% WR → floor 83)
+                    floor -= int((city_wr - 0.50) * 20)
+
+            # Source coverage penalty: fewer sources = harder to bet
+            if source_count < 4:
+                floor += max(0, (4 - source_count) * 3)
+
+        except Exception as e:
+            print(f"  [FLOOR] Error computing floor for {city}: {e}")
+
+        return floor
+
     def _get_city_bonus(self, city):
         """City-specific confidence adjustments based on track record.
 
@@ -1561,32 +1680,98 @@ class EdgeCalculator:
 
 
     def _get_calibration_adjustment(self, raw_confidence):
-        """Adjust confidence based on empirical calibration data."""
+        """Adjust confidence based on empirical calibration data.
+        v7.0: Proportional adjustment — the bigger the gap between expected and actual WR,
+        the stronger the correction. Drives confidence toward reality."""
         bucket = (raw_confidence // 5) * 5
-        bucket = max(60, min(95, bucket))  # Was 80-95, missed all low-confidence bets
+        bucket = max(60, min(95, bucket))
 
         try:
-            conn = sqlite3.connect(self.db_path)
-            c = conn.cursor()
-            c.execute(
+            from archivist import Archivist
+            _arch = Archivist(self.db_path)
+            row = _arch._fetchone(
                 "SELECT total_bets, actual_win_rate FROM weather_calibration WHERE confidence_bucket = ?",
                 (int(bucket),)
             )
-            row = c.fetchone()
-            conn.close()
 
             if not row or row[0] < 5:
                 return 0
 
             actual_rate = row[1]
             expected_rate = bucket / 100.0
-            if actual_rate < expected_rate - 0.1:
-                return -5
-            elif actual_rate > expected_rate + 0.1:
-                return 5
-            return 0
+            gap = actual_rate - expected_rate
+
+            # Proportional: every 10% gap = ±3 confidence points, clamped [-10, +10]
+            adjustment = int(gap * 30)
+            adjustment = max(-10, min(10, adjustment))
+
+            if abs(adjustment) >= 3:
+                print(f"  [CALIBRATION] bucket {bucket}: expected {expected_rate:.0%} WR, actual {actual_rate:.0%} -> adj {adjustment:+d}")
+
+            return adjustment
         except Exception:
             return 0
+
+
+    def _get_agreement_history_adjustment(self, agreement_ratio):
+        """v7.0: Query historical outcomes at similar agreement levels.
+        'When sources agreed like this before, did we win or lose?'
+        Returns confidence adjustment [-8, +8]."""
+        try:
+            from archivist import Archivist
+            _arch = Archivist(self.db_path)
+
+            # Find bets where agreement_ratio was similar (±0.1 band)
+            low_band = max(0.0, agreement_ratio - 0.1)
+            high_band = min(1.0, agreement_ratio + 0.1)
+
+            rows = _arch._fetchall("""
+                SELECT b.won FROM bet_decisions bd
+                JOIN bets b ON b.id = bd.bet_id
+                WHERE bd.category = 'weather'
+                AND b.status = 'resolved'
+                AND json_extract(bd.raw_data, '$.agreement_ratio') >= ?
+                AND json_extract(bd.raw_data, '$.agreement_ratio') <= ?
+            """, (low_band, high_band))
+
+            if len(rows) < 5:
+                return 0  # Not enough data
+
+            wins = sum(1 for r in rows if r[0])
+            wr = wins / len(rows)
+            baseline = 0.45  # Rough overall weather WR
+
+            # Proportional: (wr - baseline) * 20, clamped [-8, +8]
+            adj = int((wr - baseline) * 20)
+            adj = max(-8, min(8, adj))
+
+            if abs(adj) >= 2:
+                print(f"  [AGREEMENT-HIST] ratio ~{agreement_ratio:.2f}: {wins}W/{len(rows)} ({wr:.0%} WR) -> adj {adj:+d}")
+
+            return adj
+        except Exception:
+            return 0
+
+    def _get_source_agreement_wr(self, city, std_dev_threshold=1.5):
+        """v7.0: 'When sources agreed (low std_dev), what was our WR for this city?'
+        Used for logging/diagnostics. Returns (wr, sample_size) or (None, 0)."""
+        try:
+            from archivist import Archivist
+            _arch = Archivist(self.db_path)
+            rows = _arch._fetchall("""
+                SELECT b.won FROM bet_decisions bd
+                JOIN bets b ON b.id = bd.bet_id
+                WHERE bd.category = 'weather'
+                AND b.status = 'resolved'
+                AND json_extract(bd.raw_data, '$.std_dev') <= ?
+                AND json_extract(bd.raw_data, '$.city') = ?
+            """, (std_dev_threshold, city.lower()))
+            if not rows:
+                return None, 0
+            wins = sum(1 for r in rows if r[0])
+            return wins / len(rows), len(rows)
+        except Exception:
+            return None, 0
 
 
 # ============================================================
@@ -1696,7 +1881,7 @@ Respond in JSON:
     def _call_ai(self, prompt):
         try:
             response = self.ai_client.messages.create(
-                model="claude-haiku-4-5-20251001",
+                model="deepseek-v3.2",
                 max_tokens=2000,
                 messages=[{"role": "user", "content": prompt}]
             )
@@ -1713,7 +1898,7 @@ Respond in JSON:
                     print(f"  [WEATHER-HB] Bankr gateway error, falling back to Anthropic...")
                     fallback = anthropic.Anthropic(api_key=self.ai_fallback_key)
                     response = fallback.messages.create(
-                        model="claude-haiku-4-5-20251001",
+                        model="deepseek-v3.2",
                         max_tokens=2000,
                         messages=[{"role": "user", "content": prompt}]
                     )
@@ -1731,9 +1916,9 @@ Respond in JSON:
 
     def _get_recent_bets(self):
         try:
-            conn = sqlite3.connect(self.db_path)
-            c = conn.cursor()
-            c.execute("""
+            from archivist import Archivist
+            _arch = Archivist(self.db_path)
+            rows = _arch._fetchall("""
                 SELECT b.id, b.market_title, b.side, b.amount, b.odds, b.confidence_score,
                        b.edge, b.status, b.won, b.profit,
                        wb.city, wb.temp_range, wb.weighted_mean
@@ -1743,8 +1928,6 @@ Respond in JSON:
                 AND b.timestamp >= datetime('now', '-48 hours')
                 ORDER BY b.timestamp DESC
             """)
-            rows = c.fetchall()
-            conn.close()
             return [
                 {
                     "bet_id": r[0], "market": r[1], "side": r[2], "amount": r[3],
@@ -1759,11 +1942,9 @@ Respond in JSON:
 
     def _get_source_data(self):
         try:
-            conn = sqlite3.connect(self.db_path)
-            c = conn.cursor()
-            c.execute("SELECT city, source_name, credibility_weight, total_predictions, accurate_predictions, avg_error FROM weather_sources")
-            rows = c.fetchall()
-            conn.close()
+            from archivist import Archivist
+            _arch = Archivist(self.db_path)
+            rows = _arch._fetchall("SELECT city, source_name, credibility_weight, total_predictions, accurate_predictions, avg_error FROM weather_sources")
             return [
                 {"city": r[0], "source": r[1], "weight": r[2], "predictions": r[3],
                  "accurate": r[4], "avg_error": r[5]}
@@ -1774,11 +1955,9 @@ Respond in JSON:
 
     def _get_city_data(self):
         try:
-            conn = sqlite3.connect(self.db_path)
-            c = conn.cursor()
-            c.execute("SELECT city, total_bets, wins, win_rate, total_profit FROM weather_city_patterns")
-            rows = c.fetchall()
-            conn.close()
+            from archivist import Archivist
+            _arch = Archivist(self.db_path)
+            rows = _arch._fetchall("SELECT city, total_bets, wins, win_rate, total_profit FROM weather_city_patterns")
             return [
                 {"city": r[0], "bets": r[1], "wins": r[2], "win_rate": r[3], "profit": r[4]}
                 for r in rows
@@ -1788,11 +1967,9 @@ Respond in JSON:
 
     def _get_calibration_data(self):
         try:
-            conn = sqlite3.connect(self.db_path)
-            c = conn.cursor()
-            c.execute("SELECT confidence_bucket, total_bets, wins, actual_win_rate FROM weather_calibration")
-            rows = c.fetchall()
-            conn.close()
+            from archivist import Archivist
+            _arch = Archivist(self.db_path)
+            rows = _arch._fetchall("SELECT confidence_bucket, total_bets, wins, actual_win_rate FROM weather_calibration")
             return [
                 {"bucket": r[0], "bets": r[1], "wins": r[2], "actual_rate": r[3]}
                 for r in rows
@@ -1802,25 +1979,23 @@ Respond in JSON:
 
     def _apply_weight(self, city, source, new_weight):
         try:
-            conn = sqlite3.connect(self.db_path)
-            c = conn.cursor()
-            c.execute("""
+            from archivist import Archivist
+            _arch = Archivist(self.db_path)
+            _arch._execute("""
                 INSERT INTO weather_sources (city, source_name, credibility_weight, total_predictions, accurate_predictions, avg_error, last_updated)
                 VALUES (?, ?, ?, 0, 0, 0, ?)
                 ON CONFLICT(city, source_name) DO UPDATE SET
                     credibility_weight = ?,
                     last_updated = ?
-            """, (city, source, new_weight, datetime.now().isoformat(), new_weight, datetime.now().isoformat()))
-            conn.commit()
-            conn.close()
+            """, (city, source, new_weight, datetime.now().isoformat(), new_weight, datetime.now().isoformat()), commit=True)
         except Exception as e:
             print(f"  [WEIGHT] Error applying weight: {e}")
 
     def _log_heartbeat(self, analysis):
         try:
-            conn = sqlite3.connect(self.db_path)
-            c = conn.cursor()
-            c.execute("""
+            from archivist import Archivist
+            _arch = Archivist(self.db_path)
+            _arch._execute("""
                 INSERT INTO weather_heartbeat_logs
                 (timestamp, health, reasoning, source_adjustments, city_recommendations,
                  calibration_assessment, patterns_detected, concerns)
@@ -1834,9 +2009,7 @@ Respond in JSON:
                 analysis.get("calibration_assessment"),
                 json.dumps(analysis.get("patterns_detected")),
                 analysis.get("concerns"),
-            ))
-            conn.commit()
-            conn.close()
+            ), commit=True)
         except Exception as e:
             print(f"  [WEATHER-HB] Log error: {e}")
 
@@ -1852,6 +2025,10 @@ class WeatherAgent:
         self.notifier = notifier
         self.bankr = bankr
         self.db_path = tracker.db_path
+        from db_writer import DBWriter
+        from data_intake import DataIntake
+        self.db_writer = DBWriter(self.db_path)
+        self.data_intake = DataIntake(self.db_path)
         self.ai_client = ai_client
         self.ai_fallback_key = ai_fallback_key
 
@@ -1870,23 +2047,21 @@ class WeatherAgent:
 
     def _load_active_weather_bets(self):
         try:
-            conn = sqlite3.connect(self.db_path)
-            c = conn.cursor()
-            c.execute("""
+            from archivist import Archivist
+            _arch = Archivist(self.db_path)
+            rows = _arch._fetchall("""
                 SELECT b.id, b.market_id, b.market_title, b.amount, b.side, b.odds,
                        wb.city, wb.temp_range, wb.weighted_mean
                 FROM bets b
                 LEFT JOIN weather_bets wb ON wb.bet_id = b.id
                 WHERE b.status = 'pending' AND b.category = 'weather'
             """)
-            rows = c.fetchall()
 
-            c.execute("""
+            _cnt = _arch._fetchone("""
                 SELECT COUNT(*) FROM bets
                 WHERE DATE(timestamp) = DATE('now') AND category = 'weather'
             """)
-            self.weather_daily_bet_count = c.fetchone()[0]
-            conn.close()
+            self.weather_daily_bet_count = _cnt[0] if _cnt else 0
 
             for r in rows:
                 self.active_weather_bets.append({
@@ -1911,7 +2086,7 @@ class WeatherAgent:
         """Call Claude Haiku via Bankr LLM Gateway with Anthropic direct fallback."""
         try:
             response = self.ai_client.messages.create(
-                model="claude-haiku-4-5-20251001",
+                model="deepseek-v3.2",
                 max_tokens=2000,
                 messages=[{"role": "user", "content": prompt}]
             )
@@ -1928,7 +2103,7 @@ class WeatherAgent:
                     print(f"  [WEATHER-AI] Bankr gateway error, falling back to Anthropic...")
                     fallback = anthropic.Anthropic(api_key=self.ai_fallback_key)
                     response = fallback.messages.create(
-                        model="claude-haiku-4-5-20251001",
+                        model="deepseek-v3.2",
                         max_tokens=2000,
                         messages=[{"role": "user", "content": prompt}]
                     )
@@ -2038,8 +2213,9 @@ Respond with ONLY this JSON:
     def _ensure_snapshot_table(self):
         """Create forecast_snapshots table if it doesn't exist."""
         try:
-            conn = sqlite3.connect(self.db_path, timeout=30)
-            conn.execute("""
+            from archivist import Archivist
+            _arch = Archivist(self.db_path)
+            _arch._execute("""
                 CREATE TABLE IF NOT EXISTS forecast_snapshots (
                     id INTEGER PRIMARY KEY AUTOINCREMENT,
                     city TEXT NOT NULL,
@@ -2052,11 +2228,11 @@ Respond with ONLY this JSON:
                     collection_run INTEGER DEFAULT 0
                 )
             """)
-            conn.execute("""
+            _arch._execute("""
                 CREATE INDEX IF NOT EXISTS idx_snapshots_city_date
                 ON forecast_snapshots(city, target_date)
             """)
-            conn.execute("""
+            _arch._execute("""
                 CREATE TABLE IF NOT EXISTS forecast_collection_log (
                     id INTEGER PRIMARY KEY AUTOINCREMENT,
                     run_at TEXT NOT NULL,
@@ -2064,9 +2240,7 @@ Respond with ONLY this JSON:
                     total_readings INTEGER DEFAULT 0,
                     sources_failed TEXT
                 )
-            """)
-            conn.commit()
-            conn.close()
+            """, commit=True)
         except Exception as e:
             print(f"[WEATHER ANALYST] Error creating snapshot tables: {e}")
 
@@ -2085,7 +2259,7 @@ Respond with ONLY this JSON:
         print(f"\n[WEATHER ANALYST] === FORECAST COLLECTION RUN ===")
 
         # Scan Polymarket for active weather markets
-        markets = self.scanner.scan_weather_markets()
+        markets = self.scanner.scan_weather_markets(pre_fetched_events=getattr(self, "_scout_weather_events", None))
         if not markets:
             print("[WEATHER ANALYST] No weather markets to collect for")
             return
@@ -2140,16 +2314,16 @@ Respond with ONLY this JSON:
             # Store each reading
             if forecasts:
                 try:
-                    conn = sqlite3.connect(self.db_path, timeout=30)
+                    from archivist import Archivist
+                    _arch = Archivist(self.db_path)
                     fetched_at = dt.now().isoformat()
                     for f in forecasts:
-                        conn.execute(
+                        _arch._execute(
                             "INSERT INTO forecast_snapshots (city, target_date, source, high_temp, low_temp, unit, fetched_at) VALUES (?, ?, ?, ?, ?, ?, ?)",
                             (city, date_str, f['source'], f['high_temp'], f.get('low_temp'), f.get('unit', 'F'), fetched_at)
                         )
                         total_readings += 1
-                    conn.commit()
-                    conn.close()
+                    _arch._commit()
                 except Exception as e:
                     print(f"[WEATHER ANALYST] Error storing snapshots for {city}: {e}")
 
@@ -2157,13 +2331,12 @@ Respond with ONLY this JSON:
 
         # Log the collection run
         try:
-            conn = sqlite3.connect(self.db_path, timeout=30)
-            conn.execute(
+            from archivist import Archivist
+            _arch = Archivist(self.db_path)
+            _arch._execute(
                 "INSERT INTO forecast_collection_log (run_at, cities_scanned, total_readings, sources_failed) VALUES (?, ?, ?, ?)",
-                (dt.now().isoformat(), len(city_dates), total_readings, json.dumps(all_failed) if all_failed else None)
-            )
-            conn.commit()
-            conn.close()
+                (dt.now().isoformat(), len(city_dates), total_readings, json.dumps(all_failed) if all_failed else None),
+                commit=True)
         except Exception:
             pass
 
@@ -2173,11 +2346,12 @@ Respond with ONLY this JSON:
         """Get the best forecast data from accumulated snapshots.
         Uses the LATEST reading from each source, plus computes stability metrics."""
         try:
-            conn = sqlite3.connect(self.db_path, timeout=30)
+            from archivist import Archivist
+            _arch = Archivist(self.db_path)
             date_str = target_date.isoformat() if hasattr(target_date, 'isoformat') else str(target_date)
 
             # Get latest reading per source
-            rows = conn.execute("""
+            rows = _arch._fetchall("""
                 SELECT source, high_temp, low_temp, unit, fetched_at,
                     (SELECT COUNT(*) FROM forecast_snapshots fs2
                      WHERE fs2.city = fs.city AND fs2.target_date = fs.target_date
@@ -2197,8 +2371,7 @@ Respond with ONLY this JSON:
                 )
                 GROUP BY source
                 ORDER BY source
-            """, (city, date_str)).fetchall()
-            conn.close()
+            """, (city, date_str))
 
             if not rows:
                 return None
@@ -2220,6 +2393,10 @@ Respond with ONLY this JSON:
             stable_sources = sum(1 for f in forecasts if f["snapshot_drift"] is not None and f["snapshot_drift"] <= 1.0)
             print(f"  [SNAPSHOTS] {city} {date_str}: {len(forecasts)} sources, {total_readings} total readings, {stable_sources} stable (drift<=1F)")
 
+            # v7.0: Attach market_date so get_weighted_forecast can extract target_month
+            for f in forecasts:
+                f["market_date"] = date_str
+
             return forecasts
 
         except Exception as e:
@@ -2231,27 +2408,19 @@ Respond with ONLY this JSON:
         self._update_weather_analytics(city, side)
 
 
-    def run_weather_cycle(self, available_balance, wallet=None):
+    def run_weather_cycle(self, available_balance, wallet=None, scout_weather_events=None, risk_manager=None, compliance=None, intel_package=None):
         """Run one weather betting cycle.
         v5.0: Collect forecasts every 30 min. Only BET during windows.
         Uses accumulated snapshot data for richer decisions.
         """
         # Always try to collect forecasts (throttled internally to every 30 min)
+        self._scout_weather_events = scout_weather_events
         self.collect_forecasts()
 
         # Check if we're in a betting window (ET)
         from hedge_fund_config import WEATHER_BETTING_WINDOWS
-        import pytz
-        try:
-            et = pytz.timezone('US/Eastern')
-            now_et = datetime.now(et)
-            current_hour = now_et.hour
-            in_window = any(start <= current_hour < end for start, end in WEATHER_BETTING_WINDOWS)
-        except Exception:
-            # Fallback: UTC-5 rough estimate
-            utc_hour = datetime.utcnow().hour
-            current_hour = (utc_hour - 5) % 24
-            in_window = any(start <= current_hour < end for start, end in WEATHER_BETTING_WINDOWS)
+        current_hour = current_hour_et()
+        in_window = clock_in_window(WEATHER_BETTING_WINDOWS)
 
         if not in_window:
             print(f"\n[WEATHER ANALYST] Outside betting window (ET hour={current_hour}). Collecting data only.")
@@ -2262,6 +2431,19 @@ Respond with ONLY this JSON:
         print(f"{'='*60}")
         print(f"Weather Bets Today: {self.weather_daily_bet_count}/{WEATHER_MAX_DAILY_BETS}")
         print(f"Active Weather Positions: {len(self.active_weather_bets)}/{WEATHER_MAX_CONCURRENT}")
+
+        # V3.1: Log liaison intelligence
+        if intel_package and intel_package.get('available'):
+            wr_data = intel_package.get('rolling_win_rate')
+            streak_data = intel_package.get('streak')
+            if wr_data:
+                print(f"  [WEATHER LIAISON] WR: {wr_data}")
+            if streak_data:
+                streak_val = streak_data.get('value', 0) if isinstance(streak_data, dict) else streak_data
+                print(f"  [WEATHER LIAISON] Streak: {streak_val}")
+            cb_data = intel_package.get('circuit_breaker')
+            if cb_data:
+                print(f"  [WEATHER LIAISON] CB proximity: {cb_data}")
 
         if self.weather_daily_bet_count >= WEATHER_MAX_DAILY_BETS:
             print(f"[WEATHER ANALYST] Daily limit reached")
@@ -2276,7 +2458,7 @@ Respond with ONLY this JSON:
             print(f"[WEATHER ANALYST] Balance too low: ${available_balance:.2f}")
             return
 
-        markets = self.scanner.scan_weather_markets()
+        markets = self.scanner.scan_weather_markets(pre_fetched_events=scout_weather_events)
         if not markets:
             print("[WEATHER ANALYST] No temperature markets found (likely seasonal - will auto-scan next cycle)")
             return
@@ -2311,7 +2493,7 @@ Respond with ONLY this JSON:
                 print(f"[WEATHER ANALYST] Only {len(forecasts)} sources for {city} - need 2+ to bet")
                 continue
 
-            weighted_mean, spread, weights_used = self.credibility.get_weighted_forecast(city, forecasts)
+            weighted_mean, spread, weights_used, std_dev, agreement_ratio = self.credibility.get_weighted_forecast(city, forecasts)
             if weighted_mean is None:
                 continue
 
@@ -2321,10 +2503,11 @@ Respond with ONLY this JSON:
             for sm in event_data["sub_markets"]:
                 our_prob = self.credibility.compute_probability(
                     weighted_mean, spread, sm["temp_range"],
-                    city=city, target_date=target_date
+                    city=city, target_date=target_date, std_dev=std_dev
                 )
                 result = self.edge_calc.evaluate(
-                    sm, our_prob, spread, len(forecasts), weights_used, weighted_mean
+                    sm, our_prob, spread, len(forecasts), weights_used, weighted_mean,
+                    agreement_ratio=agreement_ratio
                 )
                 if result:
                     evaluated.append(result)
@@ -2376,7 +2559,7 @@ Respond with ONLY this JSON:
                     print(f"[WEATHER ANALYST] [WALLET] {reason}")
                     continue
 
-            success = self._execute_weather_bet(best, forecasts, available_balance, wallet=wallet)
+            success = self._execute_weather_bet(best, forecasts, available_balance, wallet=wallet, risk_manager=risk_manager, compliance=compliance)
             if success:
                 bets_placed += 1
                 bet_size = self._get_bet_size(best["confidence"], best.get("is_conviction", False))
@@ -2387,7 +2570,7 @@ Respond with ONLY this JSON:
 
         print(f"\n[WEATHER CYCLE COMPLETE] Placed {bets_placed} weather bets")
 
-    def _execute_weather_bet(self, rec, forecasts, available_balance, wallet=None):
+    def _execute_weather_bet(self, rec, forecasts, available_balance, wallet=None, risk_manager=None, compliance=None):
         """Execute a single weather bet via Bankr. v2.0: scaled sizing + verification.
         Deploy 1: wallet param for fund reservation after successful placement.
         """
@@ -2409,6 +2592,44 @@ Respond with ONLY this JSON:
         print(f"  Confidence: {rec['confidence']}")
         print(f"  Weighted Mean: {rec['weighted_mean']:.1f}F")
         print(f"  Sources: {rec['source_count']}")
+
+        # ── V3.1: Risk Manager assessment (advisory except circuit breaker) ──
+        if risk_manager:
+            bet_dict = {
+                'category': 'weather',
+                'side': rec.get('side', ''),
+                'amount': bet_amount,
+                'market_id': rec.get('market_id', rec.get('condition_id', '')),
+                'market_title': rec.get('market_title', ''),
+            }
+            risk_ok, risk_level, risk_warnings = risk_manager.assess(bet_dict)
+            if risk_warnings:
+                for w in risk_warnings:
+                    print(f"  [RISK MANAGER] {w}")
+            if not risk_ok:
+                print(f"  [RISK MANAGER] BLOCKED: {risk_warnings}")
+                return False
+            # Recovery mode sizing
+            recovery_mult = risk_manager.get_recovery_sizing_multiplier('weather')
+            if recovery_mult < 1.0:
+                bet_amount = round(bet_amount * recovery_mult, 2)
+                print(f"  [RISK MANAGER] Recovery sizing: ${bet_amount:.2f}")
+
+        # ── V3.1: Compliance pre-flight (hard gate) ──
+        if compliance:
+            comp_dict = {
+                'category': 'weather',
+                'market_id': rec.get('market_id', rec.get('condition_id', '')),
+                'market_title': rec.get('market_title', ''),
+                'amount': bet_amount,
+            }
+            approved, reason, comp_warnings = compliance.pre_flight(comp_dict)
+            if comp_warnings:
+                for w in comp_warnings:
+                    print(f"  [COMPLIANCE] {w}")
+            if not approved:
+                print(f"  [COMPLIANCE] REJECTED: {reason}")
+                return False
 
         bankr_result = self.bankr.place_bet(
             market_title=rec["market_title"],
@@ -2453,20 +2674,70 @@ Respond with ONLY this JSON:
         if rec.get("ai_reasoning"):
             reasoning += f" | AI: [{rec.get('ai_decision', '?').upper()}] {rec['ai_reasoning']}"
 
-        bet_id = self.tracker.log_bet(
+        # Build decision snapshot — full context for forensics
+        _source_details = {}
+        for f in forecasts:
+            _source_details[f["source"]] = {
+                "high_temp": f.get("high_temp"),
+                "low_temp": f.get("low_temp"),
+                "weight": rec.get("weights_used", {}).get(f["source"], 1.0),
+                "snapshot_drift": f.get("snapshot_drift"),
+                "snapshot_readings": f.get("snapshot_readings"),
+                "snapshot_avg_high": f.get("snapshot_avg_high"),
+            }
+        decision_snapshot = {
+            "raw_data": {
+                "city": rec["city"],
+                "target_date": rec["market_date"],
+                "temp_range": rec["temp_range"],
+                "sources": _source_details,
+            },
+            "modifiers": {
+                "dynamic_floor": rec.get("city_floor"),
+                "std_dev": rec.get("std_dev", 0.0),
+                "agreement_ratio": rec.get("agreement_ratio", 0.0),
+                "sigma_used": rec.get("sigma_used"),
+                "source_count": rec.get("source_count", 0),
+                "seasonal_month": rec.get("market_date", "")[:7] if rec.get("market_date") else None,
+                "stability_data": {s: {"drift": d.get("snapshot_drift"), "readings": d.get("snapshot_readings")}
+                                   for s, d in _source_details.items() if d.get("snapshot_drift") is not None},
+            },
+            "decision": {
+                "weighted_mean": rec.get("weighted_mean"),
+                "spread": rec.get("spread"),
+                "our_probability": rec.get("our_prob"),
+                "market_price": rec.get("market_price"),
+                "edge": rec.get("edge"),
+                "confidence": rec.get("confidence"),
+                "side": rec.get("side"),
+            },
+            "strategy": {
+                "city_wr": rec.get("city_wr"),
+                "city_total_bets": rec.get("city_total"),
+                "bias_corrections": rec.get("bias_corrections", {}),
+                "ai_decision": rec.get("ai_decision"),
+                "ai_reasoning": rec.get("ai_reasoning"),
+            },
+        }
+
+        bet_id = self.data_intake.validate_and_write_bet(
             market_id=rec["market_id"],
             market_title=rec["market_title"],
             category="weather",
             side=rec["side"],
             amount=bet_amount,
             odds=rec["bet_odds"],
-            score=rec["confidence"],
+            confidence_score=rec["confidence"],
             edge=rec["edge"],
             reasoning=reasoning,
             balance_before=available_balance,
+            cycle_type="weather",
+            bet_type="WEATHER",
+            format_type="temperature",
+            decision_snapshot=decision_snapshot,
         )
 
-        self.tracker.log_weather_prediction(
+        self.db_writer.record_weather_prediction(
             bet_id=bet_id,
             city=rec["city"],
             market_date=rec["market_date"],
@@ -2476,7 +2747,7 @@ Respond with ONLY this JSON:
             edge=rec["edge"],
         )
 
-        self.tracker.log_weather_bet(
+        self.db_writer.record_weather_bet(
             bet_id=bet_id,
             city=rec["city"],
             temp_range=rec["temp_range"].get("raw", ""),
@@ -2552,11 +2823,11 @@ Respond with ONLY this JSON:
         # If weighted_mean is 0, try weather_predictions table
         if weighted_mean == 0:
             try:
-                conn_wm = sqlite3.connect(self.db_path, timeout=30)
-                row_wm = conn_wm.execute(
+                from archivist import Archivist
+                _arch_wm = Archivist(self.db_path)
+                row_wm = _arch_wm._fetchone(
                     "SELECT weighted_mean FROM weather_predictions WHERE bet_id = ?", (bet_id,)
-                ).fetchone()
-                conn_wm.close()
+                )
                 if row_wm and row_wm[0]:
                     weighted_mean = row_wm[0]
                     print(f"[WEATHER ANALYST] Bet {bet_id}: recovered weighted_mean={weighted_mean:.1f}F from weather_predictions")
@@ -2565,12 +2836,11 @@ Respond with ONLY this JSON:
 
         # v2.0: Try JSON format first, then legacy columns
         try:
-            conn = sqlite3.connect(self.db_path)
-            c = conn.cursor()
+            from archivist import Archivist
+            _arch_src = Archivist(self.db_path)
 
             sources = {}
-            c.execute("SELECT forecast_data FROM weather_predictions WHERE bet_id = ?", (bet_id,))
-            row = c.fetchone()
+            row = _arch_src._fetchone("SELECT forecast_data FROM weather_predictions WHERE bet_id = ?", (bet_id,))
             if row and row[0]:
                 try:
                     forecast_data = json.loads(row[0])
@@ -2583,11 +2853,10 @@ Respond with ONLY this JSON:
                     pass
 
             if not sources:
-                c.execute("""
+                row = _arch_src._fetchone("""
                     SELECT open_meteo_high, noaa_high, weatherapi_high
                     FROM weather_predictions WHERE bet_id = ?
                 """, (bet_id,))
-                row = c.fetchone()
                 if row:
                     if row[0] is not None:
                         sources["open_meteo"] = row[0]
@@ -2597,12 +2866,8 @@ Respond with ONLY this JSON:
                         sources["weatherapi"] = row[2]
 
             # Also grab market_date for source_prediction_log
-            c2 = conn.cursor()
-            c2.execute("SELECT market_date FROM weather_predictions WHERE bet_id = ?", (bet_id,))
-            md_row = c2.fetchone()
+            md_row = _arch_src._fetchone("SELECT market_date FROM weather_predictions WHERE bet_id = ?", (bet_id,))
             market_date = md_row[0] if md_row else None
-
-            conn.close()
         except Exception:
             sources = {}
             market_date = None
@@ -2614,7 +2879,7 @@ Respond with ONLY this JSON:
         error = abs(weighted_mean - actual_high)
         predicted_high = weighted_mean
 
-        self.tracker.log_weather_resolution(
+        self.db_writer.record_weather_resolution(
             bet_id=bet_id,
             predicted_high=predicted_high,
             actual_high=actual_high,
@@ -2663,8 +2928,8 @@ Respond with ONLY this JSON:
 
         # Open-Meteo archive has ~2 day delay
         days_ago = (datetime.now().date() - target_date).days
-        if days_ago < 2:
-            print(f"[WEATHER ANALYST] Date {date_str} is only {days_ago} day(s) ago -- archive not yet available")
+        if days_ago < 1:
+            print(f"[WEATHER ANALYST] Date {date_str} is today -- archive not yet available")
             return None
 
         try:
@@ -2707,11 +2972,11 @@ Respond with ONLY this JSON:
         if not city:
             return
         try:
-            conn = sqlite3.connect(self.db_path, timeout=30)
-            c = conn.cursor()
+            from archivist import Archivist
+            _arch = Archivist(self.db_path)
 
             # Update weather_city_patterns for this city
-            c.execute("""
+            _arch._execute("""
                 INSERT OR REPLACE INTO weather_city_patterns (city, total_bets, wins, win_rate, total_profit, last_updated)
                 SELECT COALESCE(wb.city, 'unknown'), COUNT(*), SUM(b.won),
                        ROUND(CAST(SUM(b.won) AS REAL) / COUNT(*), 4),
@@ -2723,7 +2988,7 @@ Respond with ONLY this JSON:
 
             # Update weather_side_patterns for this city+side
             if side:
-                c.execute("""
+                _arch._execute("""
                     INSERT OR REPLACE INTO weather_side_patterns (city, side, total_bets, wins, win_rate, total_profit, last_updated)
                     SELECT COALESCE(wb.city, 'unknown'), b.side, COUNT(*), SUM(b.won),
                            ROUND(CAST(SUM(b.won) AS REAL) / COUNT(*), 4),
@@ -2735,16 +3000,13 @@ Respond with ONLY this JSON:
                 """, (city, side))
 
             # Update calibration bucket for the confidence score
-            c.execute("""
+            _arch._execute("""
                 INSERT OR REPLACE INTO weather_calibration (confidence_bucket, total_bets, wins, actual_win_rate, last_updated)
                 SELECT CAST(confidence_score / 10 AS INTEGER) * 10, COUNT(*), SUM(won),
                        ROUND(CAST(SUM(won) AS REAL) / COUNT(*), 4), datetime('now')
                 FROM bets WHERE category='weather' AND status='resolved' AND confidence_score IS NOT NULL
                 GROUP BY CAST(confidence_score / 10 AS INTEGER) * 10
-            """)
-
-            conn.commit()
-            conn.close()
+            """, commit=True)
         except Exception as e:
             print(f"  [WEATHER ANALYST] Analytics update error: {e}")
 
@@ -2765,13 +3027,13 @@ Respond with ONLY this JSON:
         resolved_count = 0
 
         try:
-            conn = sqlite3.connect(self.db_path)
-            c = conn.cursor()
+            from archivist import Archivist
+            _arch = Archivist(self.db_path)
 
             # Find weather bets that need resolution:
             # 1. status='resolved' but no weather_resolutions entry
             # 2. status='pending' with market_date 2+ days ago
-            c.execute("""
+            rows = _arch._fetchall("""
                 SELECT b.id, b.status, b.side, wb.city, wb.temp_range,
                        COALESCE(wp.weighted_mean, wb.weighted_mean, 0) as weighted_mean,
                        wp.market_date
@@ -2784,12 +3046,10 @@ Respond with ONLY this JSON:
                 AND (
                     b.status = 'resolved'
                     OR (b.status = 'pending' AND wp.market_date IS NOT NULL
-                        AND wp.market_date <= date('now', '-2 days'))
+                        AND wp.market_date <= date('now', '-1 days'))
                 )
                 ORDER BY b.id ASC
             """)
-            rows = c.fetchall()
-            conn.close()
 
             if not rows:
                 print(f"[WEATHER ANALYST] No unresolved weather bets found")
@@ -2864,17 +3124,14 @@ Respond with ONLY this JSON:
                     # Profit will be updated when Bankr redeems and returns exact USDC.
                     # For now, set profit=0 and let bet_resolver handle the money side.
                     try:
-                        conn2 = sqlite3.connect(self.db_path)
-                        c2 = conn2.cursor()
-                        c2.execute("SELECT amount FROM bets WHERE id = ?", (bet_id,))
-                        brow = c2.fetchone()
-                        conn2.close()
+                        _arch2 = Archivist(self.db_path)
+                        brow = _arch2._fetchone("SELECT amount FROM bets WHERE id = ?", (bet_id,))
                         if brow:
                             bet_amt = brow[0]
                             if not won:
                                 # Loss is provable: actual temp outside range = $0 returned
                                 profit = -bet_amt
-                                self.tracker.resolve_bet(bet_id, won, profit, 0)
+                                self.data_intake.validate_and_write_resolution(bet_id, won, profit, 0)
                                 print(f"[WEATHER ANALYST] Bet {bet_id} LOST (actual temp proves it): ${profit:+.2f}")
                             else:
                                 # Win: don't guess profit from odds. Leave for Bankr to redeem.
@@ -2937,15 +3194,17 @@ class PatternAnalyzer:
 
     def run_analysis(self):
         """Main entry point. Run full pattern analysis and return report."""
-        import sqlite3
+        from archivist import Archivist
         print("\n" + "=" * 60)
         print("[DETECTIVE] Running 30h strategy review...")
         print("=" * 60)
 
         try:
-            conn = sqlite3.connect(self.db_path, timeout=30)
-            conn.row_factory = sqlite3.Row
-            c = conn.cursor()
+            _arch = Archivist(self.db_path)
+            # PatternAnalyzer sub-methods use cursor c — wrap Archivist connection
+            _conn = _arch._conn()
+            _conn.row_factory = __import__('sqlite3').Row
+            c = _conn.cursor()
 
             report_sections = []
 
@@ -2968,8 +3227,6 @@ class PatternAnalyzer:
             crypto_report = self._analyze_crypto(c)
             if crypto_report:
                 report_sections.append(crypto_report)
-
-            conn.close()
 
             full_report = self._compile_report(report_sections)
             print(full_report)
@@ -3251,16 +3508,13 @@ class PatternAnalyzer:
 
     def _log_analysis(self, report):
         """Save analysis to strategy_log table."""
-        import sqlite3
         try:
-            conn = sqlite3.connect(self.db_path, timeout=30)
-            c = conn.cursor()
-            c.execute(
+            from archivist import Archivist
+            _arch = Archivist(self.db_path)
+            _arch._execute(
                 "INSERT INTO strategy_log (version, change_type, description, rationale, expected_impact) VALUES (?, ?, ?, ?, ?)",
-                ("auto", "PATTERN_ANALYSIS", report[:500], "Automated 30h pattern review", "Informational")
-            )
-            conn.commit()
-            conn.close()
+                ("auto", "PATTERN_ANALYSIS", report[:500], "Automated 30h pattern review", "Informational"),
+                commit=True)
         except Exception as e:
             print(f"  [DETECTIVE] Log error: {e}")
 
