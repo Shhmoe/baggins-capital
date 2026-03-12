@@ -1,6 +1,7 @@
 """
-Hedge Fund Agent Configuration — Baggins Capital V3.1
+Baggins OpenSource Company — Configuration v3.3
 Each department has its own isolated parameter block. No overlap.
+Customize these parameters to match your trading strategy and risk tolerance.
 """
 
 # ═══════════════════════════════════════════════════════════════

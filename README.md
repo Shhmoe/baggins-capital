@@ -1,46 +1,64 @@
-# Baggins Capital
+# Baggins OpenSource Company
 
-An autonomous agent company that trades prediction markets on [Polymarket](https://polymarket.com). Built as a system of specialized "employees" — each one owns a single job, communicates through defined interfaces, and learns from its own results.
+An open-source autonomous agent framework for trading prediction markets. Built as a system of specialized "employees" organized into departments — each with a single responsibility, communicating through defined interfaces, and learning from its own results.
 
-This isn't a trading bot with if-statements. It's a company architecture: departments, data pipelines, compliance gates, risk management, intelligence liaisons, and a hiring/firing structure. The trading departments (crypto, weather, sports, scalper) are what Baggins Capital runs — but the architecture works for anything. Build your own departments.
+This is not a trading bot. It is a company architecture: departments, data pipelines, compliance gates, risk management, intelligence liaisons, and an extensible hiring structure. The included trading departments (crypto, weather, sports, scalper) are reference implementations. The framework is designed so you can build, customize, and plug in your own.
 
-Powered by [Bankr](https://bankr.bot/) for trade execution and wallet management.
+Powered by [Bankr](https://bankr.bot/) for trade execution and wallet management on [Polymarket](https://polymarket.com).
+
+---
+
+## How It Works
+
+The Manager (CEO) runs a continuous orchestration loop. Every 2 minutes, it executes a full cycle:
+
+```
+ STEP 0: MARKET SCOUT
+ ┌──────────────┐
+ │ Market Scout  │──scan()──> Gamma API ──> Screen & classify ──> Route to:
+ └──────────────┘                              │
+                          ┌────────────────────┼────────────────────┐
+                          v                    v                    v
+                    crypto_queue         weather_queue         sports_queue
+
+ STEPS 1-7: PRE-TRADING CHECKS (all must pass before any department trades)
+ ┌─────────┐    ┌──────────────┐    ┌────────────┐    ┌──────────────┐
+ │   CFO   │───>│ Risk Manager │───>│ Compliance │───>│ Market Pulse │
+ │ (Wallet)│    │  (Circuit    │    │ (Blocklist │    │  (30-min     │
+ │         │    │   Breakers)  │    │  + Caps)   │    │   refresh)   │
+ └─────────┘    └──────────────┘    └────────────┘    └──────────────┘
+
+ IF CFO unavailable ──> HALT ALL TRADING ──> sleep & retry
+
+ STEP 8: RUN DEPARTMENTS (priority order — seniority on capital)
+   Dept 1: Weather  ──> Weather Forecaster ──> WeatherAgent ──> Banker
+   Dept 2: Scalper  ──> UpDown Trader ──> Banker
+   Dept 3: Crypto   ──> CryptoMarketScanner ──> Banker
+   Dept 4: Avantis  ──> Avantis Signals ──> On-chain execution
+   Dept 5: Sports   ──> Sports Analyst ──> Banker
+
+ POST-TRADING: SETTLEMENT + MONITORING
+   Settlement Clerk ──> Position Checks ──> Manager Heartbeat
+```
 
 ---
 
 ## Architecture
 
-The core idea: **every function is an employee, every employee has one job, and data flows through defined pipelines — never shortcuts.**
-
-```
-┌─────────────────────────────────────────────────────────────────┐
-│                        THE MANAGER                              │
-│                   (orchestration loop)                           │
-│                                                                 │
-│  Every 2 minutes:                                               │
-│    1. Fire scheduled hooks (Company Clock)                      │
-│    2. Refresh wallet (CFO)                                      │
-│    3. Scan all markets (Market Scout)                           │
-│    4. Update real-time intelligence (Market Pulse)              │
-│    5-8. Run each trading department                             │
-│    9. Resolve settled bets (Settlement Clerk)                   │
-│   10. Check investigation schedule (Detective)                  │
-│                                                                 │
-└─────────────────────────────────────────────────────────────────┘
-```
+The core principle: **every function is an employee, every employee has one job, and data flows through defined pipelines — never shortcuts.**
 
 ### The Bet Pipeline
 
 Every bet — regardless of department — passes through the same pipeline:
 
 ```
-Market Scout ──→ Intelligence Liaison ──→ Risk Manager ──→ Compliance
+Market Scout ──> Intelligence Liaison ──> Risk Manager ──> Compliance
      │                  │                      │               │
   (scan &           (package              (advisory:       (HARD GATE:
    filter)          DB insights)          warnings)       pass/reject)
                                                               │
-                                                              ▼
-                                               The Banker ──→ Data Intake ──→ DB Writer
+                                                              v
+                                               The Banker ──> Data Intake ──> DB Writer
                                                    │              │               │
                                                (execute        (validate       (format &
                                                 trade)         fields)         write SQL)
@@ -48,97 +66,174 @@ Market Scout ──→ Intelligence Liaison ──→ Risk Manager ──→ Com
 
 No department can skip Compliance. No module can write to the database directly. No trader talks to the exchange — only the Banker does.
 
----
+### The Banker — Sole Bet Executor
 
-## The Employees (25)
+Every department recommendation flows through the Banker's 7-gate process:
 
-### Executive (2)
-
-| Employee | File | Job |
-|----------|------|-----|
-| **The Manager** | `hedge_fund_active.py` | Runs the 10-step cycle. Fires hooks. Coordinates everyone. |
-| **The CFO** | `wallet_coordinator.py` | Capital allocation. Deployment caps. Position limits. Adaptive weekly. |
-
-### Trading Desk (9)
-
-| Employee | File | Job |
-|----------|------|-----|
-| **Market Scout** | `market_scout.py` | Single API fetch, 7 disqualification checks, department queues |
-| **Crypto Trader** | `polymarket_crypto.py` | Crypto, commodities, equities, indices. Data-driven modifiers. |
-| **Weather Analyst** | `weather_agent.py` | 7 weather APIs, credibility engine, source agreement, dynamic city floors |
-| **Scalper** | `updown_trader.py` | 15-min Up/Down markets. Technical indicators from candle data. |
-| **Sports Buddy** | `sports_analyst.py` | Bookmaker odds comparison, fighter stats scraping |
-| **Crypto Liaison** | `intel_crypto.py` | Pre-packages DB intelligence for Crypto Trader |
-| **Weather Liaison** | `intel_weather.py` | Pre-packages DB intelligence for Weather Analyst |
-| **Scalper Liaison** | `intel_scalper.py` | Pre-packages DB intelligence for Scalper |
-| **Sports Liaison** | `intel_sports.py` | Pre-packages DB intelligence for Sports Buddy |
-
-### Operations (5)
-
-| Employee | File | Job |
-|----------|------|-----|
-| **The Banker** | `bankr.py` | SOLE exchange interface. No other module touches the exchange API. |
-| **Settlement Clerk** | `bet_resolver.py` | Resolves bets, claims winnings, matches positions |
-| **The Messenger** | `bet_notifier.py` | Queues notifications (Telegram, etc.) |
-| **Compliance Officer** | `compliance.py` | Hard gate. `pre_flight()` — pass or reject. Performance-scaled caps. |
-| **Data Intake** | `data_intake.py` | Validates all incoming bet/resolution data before DB |
-
-### Data & Analytics (8)
-
-| Employee | File | Job |
-|----------|------|-----|
-| **DB Writer** | `db_writer.py` | All database writes. Never reads. |
-| **DB Reader** | `db_reader.py` | All database reads. Never writes. |
-| **DB Steward** | `db_steward.py` | Schema, migrations, health checks |
-| **The Historian** | `historian.py` | Daily deep analysis at reset time |
-| **Market Pulse** | `market_pulse.py` | Real-time intelligence feed (30-min staleness max) |
-| **The Detective** | `detective.py` | 30-hour forensic investigation cycles |
-| **Signals Librarian** | `signals_library.py` | Institutional memory of Detective findings |
-| **Risk Manager** | `risk_manager.py` | Advisory risk. Statistical circuit breaker. |
-
-### Infrastructure (1)
-
-| Employee | File | Job |
-|----------|------|-----|
-| **Company Clock** | `company_clock.py` | Time authority (ET). 19-hook event system. |
+| Gate | Action |
+|------|--------|
+| Gate 0 | Validate required fields |
+| Gate 1 | Compliance pre-flight (HARD BLOCK) |
+| Gate 2 | CFO wallet check (HARD BLOCK) |
+| Gate 3 | Place bet via Bankr API |
+| Gate 4 | Verify execution |
+| Gate 5 | Log to database (Archivist via DataIntake) |
+| Gate 6 | Reserve funds in Wallet |
+| Gate 7 | Track and return result |
 
 ---
 
-## How to Build Your Own Departments
+## Departments
 
-The trading departments (crypto, weather, sports, scalper) are examples. The architecture doesn't care what you trade — it cares about the pipeline.
+The framework ships with 5 trading departments as reference implementations. Each can be enabled, disabled, or replaced independently.
 
-### To add a new department:
+### Department 1: Weather
 
-**1. Create a Trader** (`your_trader.py`)
+Forecasts temperature ranges using multi-source consensus from 7+ weather APIs. Computes weighted mean, agreement ratio, and standard deviation across sources. Each source is tracked for credibility and bias.
+
+**Pipeline:** Weather Intel (Liaison) -> Weather Forecaster (7 APIs) -> WeatherAgent (confidence scoring) -> Banker
+
+### Department 2: Scalper
+
+Trades 15-minute Up/Down binary markets using multi-timeframe technical analysis on candle data.
+
+**Pipeline:** Scalper Intel (Liaison) -> UpDown Trader (technical indicators) -> Banker
+
+### Department 3: Crypto
+
+Evaluates crypto, equities, commodities, and indices markets. Uses an 8-step evaluation process: distance + momentum, true probability, mispricing detection, signal stacking, strategy gates, confidence scoring, and bet sizing.
+
+**Pipeline:** Crypto Intel (Liaison) + Crypto Analyst (8 data sources) -> CryptoMarketScanner -> Banker
+
+### Department 4: Avantis Leverage
+
+Leveraged trading on the Base blockchain. Operates on a separate chain with its own executor (does not use the Banker).
+
+**Pipeline:** Avantis Signals -> Avantis Executor -> On-chain execution
+
+### Department 5: Sports
+
+Exploratory department for sports betting. Compares bookmaker odds to find edge.
+
+**Pipeline:** Sports Intel (Liaison) -> Sports Analyst -> Banker
+
+---
+
+## Employee Roster
+
+The framework includes 30 employees across 6 departments:
+
+### Executive
+
+| Employee | File | Role |
+|----------|------|------|
+| The Manager | `hedge_fund_active.py` | CEO / orchestrator. Runs the cycle, fires hooks, coordinates all departments. |
+
+### Trading Desk
+
+| Employee | File | Role |
+|----------|------|------|
+| Market Scout | `market_scout.py` | Scans markets, classifies by type, routes to department queues. |
+| Crypto Market Scanner | `polymarket_crypto.py` | Evaluates crypto, equities, commodities, indices. |
+| Crypto Analyst | (integrated) | 8-source sentiment and data analysis (Fear & Greed, news, on-chain). |
+| Weather Agent | `weather_agent.py` | Multi-source weather forecasting and confidence scoring. |
+| UpDown Trader | `updown_trader.py` | 15-minute binary scalping with technical indicators. |
+| Sports Analyst | `sports_analyst.py` | Bookmaker odds comparison and edge detection. |
+| Avantis Signals | `avantis_signals.py` | Generates leveraged trading signals. |
+| Avantis Executor | `avantis_executor.py` | Executes leveraged trades on-chain. |
+
+### Intelligence
+
+| Employee | File | Role |
+|----------|------|------|
+| Crypto Intel | `intel_crypto.py` | Packages DB intelligence for Crypto department. |
+| Scalper Intel | `intel_scalper.py` | Packages DB intelligence for Scalper department. |
+| Weather Intel | `intel_weather.py` | Packages DB intelligence for Weather department. |
+| Sports Intel | `intel_sports.py` | Packages DB intelligence for Sports department. |
+
+### Settlement
+
+| Employee | File | Role |
+|----------|------|------|
+| The Banker | `bankr.py` | Sole exchange interface. No other module touches the exchange API. |
+| Bet Resolver | `bet_resolver.py` | Claims expired bets, resolves settlements. |
+| Bankr MCP Client | `bankr_executor.py` | API wrapper for Bankr execution. |
+
+### Operations
+
+| Employee | File | Role |
+|----------|------|------|
+| Compliance Officer | `compliance.py` | Hard gate. `pre_flight()` — pass or reject. Performance-scaled caps. |
+| Risk Manager | `risk_manager.py` | Advisory risk assessment. Statistical circuit breakers. |
+| Wallet Coordinator | `wallet_coordinator.py` | CFO: capital allocation, deployment caps, position limits. |
+| Company Clock | `company_clock.py` | Time authority. 19-hook event system for scheduling. |
+
+### Data and Analytics
+
+| Employee | File | Role |
+|----------|------|------|
+| Archivist | `archivist.py` | Performance tracking and archival. |
+| DB Writer | `db_writer.py` | All database writes. Never reads. |
+| DB Reader | `db_reader.py` | All database reads. Never writes. |
+| DB Steward | `db_steward.py` | Schema, migrations, health checks. |
+| Data Intake | `data_intake.py` | Validates all incoming bet/resolution data before DB. |
+| Market Pulse | `market_pulse.py` | Real-time metrics feed (30-min max staleness). |
+| Market Scout | `market_scout.py` | Market scanning and classification. |
+| Detective | `detective.py` | 30-hour forensic investigation cycles. |
+| Signals Library | `signals_library.py` | Institutional memory of Detective findings. |
+| Pattern Analyzer | (integrated) | Automated strategy review. |
+| Historian | `historian.py` | Daily deep analysis at reset time. |
+| Bet Notifier | `bet_notifier.py` | Notification dispatcher (Telegram). |
+
+---
+
+## Heartbeat Schedule
+
+| Component | Interval | Purpose |
+|-----------|----------|---------|
+| Market Pulse | 30 min | Win rates, streaks, circuit breaker proximity, exposure |
+| UpDown Session | per cycle | Real-time budget tracking |
+| Wallet Sync | 4 hours | On-chain balance verification |
+| Manager AI | 6 hours | Portfolio health review via AI |
+| Detective | 30 hours | Forensic pattern detection |
+| Pattern Analyzer | 30 hours | Strategy effectiveness review |
+| Weather AI | 48 hours | Source credibility recalibration |
+
+---
+
+## How to Build Your Own Department
+
+The included departments are reference implementations. The architecture supports any market type. To add your own:
+
+### 1. Create a Trader (`your_trader.py`)
 - Receives a pre-screened market queue from Market Scout
 - Receives an intelligence package from its Liaison
-- Scores opportunities, picks the best, passes to the pipeline
+- Scores opportunities and builds recommendations
 - Never touches the database directly
 - Never talks to the exchange directly
 
-**2. Create a Liaison** (`intel_your_dept.py`)
+### 2. Create a Liaison (`intel_your_dept.py`)
 - Reads from `pulse_insights` and `historian_insights` tables
 - Packages data into a dict the Trader can consume
 - The Trader never queries analytics tables — the Liaison does that
 
-**3. Add keywords to Market Scout** (`market_scout.py`)
-- Add your keywords to the classification logic
+### 3. Add Keywords to Market Scout (`market_scout.py`)
+- Add classification keywords for your market type
 - Add a department config block to `SCOUT_CONFIG`
 - Add format compatibility rules to `FORMAT_COMPATIBILITY`
 
-**4. Add config** (`hedge_fund_config.py`)
-- Bet size, daily cap, concurrent cap, min edge, min confidence
-- Each department gets its own isolated section — no parameter overlap
+### 4. Add Configuration (`hedge_fund_config.py`)
+- Bet size range, daily cap, concurrent cap, minimum edge, minimum confidence
+- Each department gets its own isolated section
 
-**5. Wire it in the Manager** (`hedge_fund_active.py`)
+### 5. Wire into the Manager (`hedge_fund_active.py`)
 - Add your trader to the cycle
 - Pass `risk_manager`, `compliance`, and `intel_package`
 
-**6. Update Compliance** (`compliance.py`)
+### 6. Update Compliance (`compliance.py`)
 - Add your department to `BASE_CAPS` and `CAP_FLOORS`
 
-That's it. Risk Manager, Compliance, Data Intake, DB Writer, Settlement Clerk, Historian, Market Pulse, Detective — they all work automatically for any department. You only build the Trader and the Liaison.
+That's it. Risk Manager, Compliance, Data Intake, DB Writer, Settlement Clerk, Historian, Market Pulse, and Detective all work automatically for any new department.
 
 ---
 
@@ -152,67 +247,73 @@ That's it. Risk Manager, Compliance, Data Intake, DB Writer, Settlement Clerk, H
 
 ### Intelligence Pipeline
 ```
-DB (raw data) → Market Pulse (real-time metrics) → Historian (daily analysis)
-                         ↓                               ↓
+DB (raw data) -> Market Pulse (real-time metrics) -> Historian (daily analysis)
+                         |                               |
                   pulse_insights table            historian_insights table
-                         ↓                               ↓
+                         |                               |
                     Intelligence Liaisons (package both into briefing)
-                         ↓
+                         |
                     Traders (consume briefing, never query raw tables)
 ```
 
-### Adaptive Limits (weekly recalibration)
-Three modules recalibrate at the `MONDAY_OPEN` hook:
+### Adaptive Limits
+Three modules recalibrate weekly at the `MONDAY_OPEN` hook:
 - **CFO**: Deployment cap (60-80%), position limits, per-bet ceiling
 - **Risk Manager**: Exposure ceilings, correlation thresholds, circuit breaker sensitivity
 - **Compliance**: Daily bet caps (0.5x-1.5x multiplier by department win rate)
 
-All limits are **data-driven from the database**, not hardcoded.
+All limits are data-driven from the database, not hardcoded.
 
 ### Decision Snapshots
-Every bet records a full snapshot of WHY it was placed — all inputs, modifiers, scores, and reasoning. This is what the Historian and Detective analyze. Without snapshots, you can't learn.
+Every bet records a full snapshot of why it was placed — all inputs, modifiers, scores, and reasoning. This is what the Historian and Detective analyze.
 
 ### The Clock Hook System
-Instead of scattering `if hour == 22` checks everywhere, the Company Clock fires named events:
+Instead of scattering time checks everywhere, the Company Clock fires named events:
 ```
 DAILY_RESET, PRE_RESET, MONDAY_OPEN, FRIDAY_CLOSE,
 MONTH_START, MONTH_END, CIRCUIT_BREAKER, CIRCUIT_BREAKER_CLEAR,
-DAILY_CAP_HIT, DAILY_CAP_WARNING, WIN_RATE_DROP, ...
+DAILY_CAP_HIT, DAILY_CAP_WARNING, WIN_RATE_DROP, ECONOMIC_CALENDAR ...
 ```
 Modules register callbacks. The Manager fires due hooks at the top of each cycle.
+
+### Daily Reset (22:00 UTC)
+```
+PRE_RESET_HOOK (21:45) ──> Archive pulse metrics
+         |
+         v
+Historian Daily Analysis ──> Compliance Daily Reset ──> Reset All Counters
+                                                         bet_count=0
+                                                         losses=0
+                                                         wallet.reset
+──> Summary notification ──> Save daily performance ──> sleep ──> NEXT CYCLE
+```
 
 ---
 
 ## Data Sources
 
-### Crypto Trader
-- **CoinGecko** — real-time crypto prices, 24h change, momentum
-- **Yahoo Finance** — equities, commodities, indices (+ crypto fallback)
+The framework integrates with multiple free-tier data sources. All are optional except Bankr (for execution).
 
-### Weather Analyst
-- **Open-Meteo** — free, global forecasts (no key needed)
-- **NOAA/NWS** — US cities (no key needed)
-- **WeatherAPI.com** — global (free tier)
-- **OpenWeatherMap** — global (free tier)
-- **Visual Crossing** — global (free tier)
-- **Weatherbit** — global (free tier)
-- **Pirate Weather** — global (free tier, Dark Sky-compatible)
-- **Open-Meteo Archive** — 2-year historical baseline
-
-### Scalper
-- **Binance US** — 1-min candles for technical indicators
-
-### Sports Buddy
-- **The Odds API** — bookmaker odds for edge calculation
-- **UFC Stats** — fighter records (HTML scraping)
-
-### Shared
-- **Polymarket Gamma API** — all market data (Market Scout)
-- **Bankr API** — trade execution, positions, balance
+| Source | Department | Notes |
+|--------|-----------|-------|
+| Polymarket Gamma API | All | Market scanning and classification |
+| Bankr API | All | Trade execution, positions, balance |
+| CoinGecko | Crypto | Real-time crypto prices |
+| Yahoo Finance | Crypto | Equities, commodities, indices (+ crypto fallback) |
+| Open-Meteo | Weather | Free, no key needed |
+| NOAA/NWS | Weather | US cities, no key needed |
+| WeatherAPI.com | Weather | Free tier |
+| OpenWeatherMap | Weather | Free tier |
+| Visual Crossing | Weather | Free tier |
+| Weatherbit | Weather | Free tier |
+| Pirate Weather | Weather | Free tier |
+| Open-Meteo Archive | Weather | 2-year historical baseline |
+| Binance US | Scalper | 1-min candles for technical indicators |
+| The Odds API | Sports | Bookmaker odds (500 req/month free tier) |
 
 ---
 
-## Running
+## Getting Started
 
 ```bash
 # 1. Clone and configure
@@ -224,7 +325,7 @@ cp .env.example .env
 # 2. Install dependencies
 pip install requests python-dotenv anthropic
 
-# 3. Run
+# 3. Run (dry run mode by default)
 python3 hedge_fund_active.py
 ```
 
@@ -234,43 +335,41 @@ The Manager handles everything — cycle loop, hook firing, market scanning, int
 
 ## Configuration
 
-All parameters live in `hedge_fund_config.py`, organized by department:
+All parameters live in `hedge_fund_config.py`, organized by department. Each department has its own isolated section with no parameter overlap.
 
+### Department Toggles
 ```python
-# Each department has its own isolated section
-CRYPTO_MAX_DAILY_BETS = 25
-CRYPTO_MAX_CONCURRENT = 20
-CRYPTO_MIN_EDGE = 0.12
+ENABLE_CRYPTO_MODULE = True
+ENABLE_WEATHER_MODULE = True
+ENABLE_UPDOWN_MODULE = True
+ENABLE_SPORTS_MODULE = False
+ENABLE_AVANTIS = False
+```
 
-WEATHER_MAX_DAILY_BETS = 30
-WEATHER_MAX_CONCURRENT = 20
-WEATHER_BETTING_WINDOWS = [(7, 11), (13, 17), (20, 24)]
+### Per-Department Settings
+Each department defines: bet size range, daily cap, concurrent position cap, minimum edge, and minimum confidence. Customize these to match your risk tolerance and capital.
 
-UPDOWN_MAX_DAILY = 8
-UPDOWN_MAX_CONCURRENT = 4
-
-SPORTS_MAX_DAILY = 3
-SPORTS_MAX_CONCURRENT = 3
-
-# Global limits (CFO enforces)
-TOTAL_MAX_CONCURRENT = 40
-TOTAL_MAX_DEPLOYMENT_PCT = 0.75
-MIN_RESERVE_BALANCE = 5.0
+### Global Limits (CFO Enforces)
+```python
+TOTAL_MAX_DEPLOYMENT_PCT = 0.75    # Max 75% of capital deployed
+TOTAL_MAX_CONCURRENT = 40          # Hard cap on all positions
+MIN_RESERVE_BALANCE = 5.0          # Always keep reserve
+MAX_BET_SIZE = 0.10                # Never >10% on single market
 ```
 
 ---
 
 ## Database
 
-SQLite in WAL mode. The DB Steward manages all schema and migrations.
+SQLite in WAL mode. The DB Steward manages schema and migrations automatically.
 
 | Table | Purpose |
 |-------|---------|
-| `bets` | Every bet (market, side, amount, odds, result, profit) |
+| `bets` | Every bet placed (market, side, amount, odds, result, profit) |
 | `bet_decisions` | Full decision snapshots (JSON of all inputs/modifiers) |
-| `forecast_snapshots` | Every weather API reading |
-| `weather_sources` | Per-source credibility, bias, avg error |
-| `weather_city_patterns` | Win rate per city (drives dynamic floor) |
+| `forecast_snapshots` | Weather API readings |
+| `weather_sources` | Per-source credibility, bias, average error |
+| `weather_city_patterns` | Win rate per city |
 | `pulse_insights` | Market Pulse real-time metrics |
 | `historian_insights` | Historian daily analysis |
 | `signals_library` | Detective findings |
@@ -284,4 +383,4 @@ SQLite in WAL mode. The DB Steward manages all schema and migrations.
 
 ## License
 
-Do whatever you want with it. Build your own company. Add your own departments. Make it better.
+Open source. Build your own company. Add your own departments. Customize everything.
